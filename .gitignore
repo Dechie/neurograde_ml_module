@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/
+VENV/
+pip-wheel-metadata/
+.DS_Store # macOS specific
+
+# Project CodeNet Dataset (VERY IMPORTANT - This is likely huge)
+# Assuming your Project_CodeNet directory is at ../Project_CodeNet/
+# relative to your .gitignore file's location (usually the project root)
+# Adjust the path if necessary.
+../Project_CodeNet/data/
+../Project_CodeNet/metadata/ # If you want to ignore the raw metadata files too
+# Or, if Project_CodeNet is directly inside your project root:
+# Project_CodeNet/data/
+# Project_CodeNet/metadata/
+
+# CSV files
+*.csv
+
+# If your "data/final_problem_statements.csv" is an INPUT and should be tracked,
+# you might want to be more specific with the generated files above or use a pattern
+# like 'data/submissions_*.csv' and 'data/submission_stats_*.csv'
+# However, if "data/" is purely for generated output, you could even do:
+# data/
+
+# Extracted language submissions (if you used the extraction script)
+# (Assuming it created 'extracted_language_submissions/' in your project root)
+extracted_language_submissions/
+
+# IDE specific files
+.idea/ # IntelliJ / PyCharm
+.vscode/ # VS Code
+*.swp # Vim swap files
+*.swo # Vim swap files
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Build artifacts (if you compile anything, e.g., C++ utilities)
+build/
+dist/
+*.o
+*.so
+*.dll
+*.exe
+
+# Virtual environment caches (if applicable)
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Logs
+*.log
