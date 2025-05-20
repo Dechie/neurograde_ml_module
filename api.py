@@ -1,5 +1,3 @@
-# api.py (Updated for Multi-Language Support)
-
 import os
 import json
 import joblib
@@ -7,11 +5,12 @@ import torch
 from flask import Flask, request, jsonify
 from typing import Dict, Any, Optional, List
 
+# --- Import your custom modules ---
 try:
     from preprocessor import Preprocessor
     from code_normalizer import CodeNormalizer
     from text_embedder import TextEmbedder
-    from code_embedder import CodeEmbedderGNN
+    from code_embedder import CodeEmbedderGNN  # Corrected import
     from concat_embedder import ConcatEmbedder
     from submission_predictor import SubmissionPredictor
 except ImportError as e:
@@ -24,81 +23,101 @@ except ImportError as e:
 try:
     import api_config as cfg
 except ImportError:
-    print(
-        "CRITICAL ERROR: api_config.py not found. Please create it with necessary configurations."
-    )
+    print("CRITICAL ERROR: api_config.py not found. Create it with configurations.")
     exit()
 
-# --- Global variables to hold loaded components ---
-# Models and associated components will be keyed by language (lowercase)
-loaded_models: Dict[str, SubmissionPredictor] = (
-    {}
-)  # Stores a SubmissionPredictor for each language
-# Preprocessor and CodeNormalizer can be shared if they are language-agnostic enough
-# or if their methods correctly handle different languages.
+loaded_models: Dict[str, SubmissionPredictor] = {}
 loaded_preprocessor: Optional[Preprocessor] = None
 loaded_code_normalizer: Optional[CodeNormalizer] = None
+# --- Global TextEmbedder instance ---
+loaded_global_text_embedder: Optional[TextEmbedder] = None
 
 app = Flask(__name__)
 
 
 def load_inference_components():
-    """
-    Loads all necessary components FOR EACH SUPPORTED LANGUAGE for inference.
-    This function is called once when the Flask app starts.
-    """
-    global loaded_models, loaded_preprocessor, loaded_code_normalizer
+    global loaded_models, loaded_preprocessor, loaded_code_normalizer, loaded_global_text_embedder
 
-    print("--- Loading inference components for multiple languages ---")
+    print("--- Loading inference components (with Global TextEmbedder) ---")
     device = torch.device(cfg.DEVICE_API)
 
-    # Initialize shared Preprocessor and CodeNormalizer (if they are truly shared)
     loaded_preprocessor = Preprocessor()
     loaded_code_normalizer = CodeNormalizer()
     print("Shared Preprocessor and CodeNormalizer initialized.")
 
-    for lang_key, lang_value_for_filename in cfg.API_SUPPORTED_LANGUAGES.items():
-        print(f"\n--- Loading components for language: {lang_key} ---")
+    # --- 1. Load the GLOBALLY FITTED TextEmbedder's TfidfVectorizer ---
+    print(
+        f"Loading Global TextEmbedder TfidfVectorizer from: {cfg.GLOBAL_TEXT_EMBEDDER_VECTORIZER_FILE}"
+    )
+    try:
+        if not os.path.exists(cfg.GLOBAL_TEXT_EMBEDDER_VECTORIZER_FILE):
+            print(
+                f"ERROR: Global TextEmbedder vectorizer file NOT FOUND at '{cfg.GLOBAL_TEXT_EMBEDDER_VECTORIZER_FILE}'. API cannot effectively start for text features."
+            )
+            raise FileNotFoundError  # Or handle more gracefully by disabling text features
+
+        tfidf_vectorizer_fitted = joblib.load(cfg.GLOBAL_TEXT_EMBEDDER_VECTORIZER_FILE)
+        loaded_global_text_embedder = TextEmbedder(
+            vectorizer_model=tfidf_vectorizer_fitted
+        )
+        loaded_global_text_embedder._fitted = (
+            True  # Assume joblib restores a fitted model
+        )
+
+        if not (
+            hasattr(loaded_global_text_embedder.vectorizer, "vocabulary_")
+            and loaded_global_text_embedder.vectorizer.vocabulary_
+        ):
+            print(
+                f"WARNING: Loaded Global TfidfVectorizer does not appear to be fitted (no vocabulary)."
+            )
+            loaded_global_text_embedder._fitted = False
+
+        print(
+            f"Global TextEmbedder loaded. Fitted: {loaded_global_text_embedder._fitted}, Vocab size: {len(loaded_global_text_embedder.get_feature_names()) if loaded_global_text_embedder._fitted else 'N/A'}"
+        )
+    except Exception as e:
+        print(
+            f"ERROR: Failed to load Global TextEmbedder vectorizer: {e}. Text embedding will not work."
+        )
+        # loaded_global_text_embedder will remain None or in an unfitted state
+        # Subsequent ConcatEmbedder initializations might warn or fail if they strictly need a fitted TextEmbedder dimension.
+        # For robustness, we could create a dummy unfitted TextEmbedder here.
+        if loaded_global_text_embedder is None:
+            loaded_global_text_embedder = TextEmbedder()  # Create a non-fitted instance
+            print("Created a default, non-fitted Global TextEmbedder as fallback.")
+
+    for lang_key in cfg.API_SUPPORTED_LANGUAGES.keys():
+        print(f"\n--- Loading language-specific components for: {lang_key} ---")
         try:
-            # Construct file paths for the current language
-            model_file = cfg.MODEL_FILE_TPL.format(
-                lang_key=lang_key, lang_value=lang_value_for_filename
+            lang_specific_components_dir = os.path.join(
+                cfg.SAVED_COMPONENTS_BASE_DIR_API, lang_key
             )
-            text_embedder_vectorizer_file = (
-                cfg.TEXT_EMBEDDER_VECTORIZER_FILE_TPL.format(
-                    lang_key=lang_key, lang_value=lang_value_for_filename
-                )
-            )
-            code_gnn_vocab_file = cfg.CODE_GNN_VOCAB_FILE_TPL.format(
-                lang_key=lang_key, lang_value=lang_value_for_filename
-            )
-
-            # 1. Load TextEmbedder's TfidfVectorizer for this language
-            print(
-                f"  Loading TextEmbedder TfidfVectorizer from: {text_embedder_vectorizer_file}"
-            )
-            tfidf_vectorizer_fitted = joblib.load(text_embedder_vectorizer_file)
-            text_embedder_for_lang = TextEmbedder(
-                vectorizer_model=tfidf_vectorizer_fitted
-            )
-            text_embedder_for_lang._fitted = (
-                True  # Assume joblib restores a fitted model
-            )
-            if (
-                not hasattr(text_embedder_for_lang.vectorizer, "vocabulary_")
-                or not text_embedder_for_lang.vectorizer.vocabulary_
-            ):
+            if not os.path.isdir(lang_specific_components_dir):
                 print(
-                    f"  WARNING: Loaded TfidfVectorizer for {lang_key} does not appear to be fitted."
+                    f"  WARNING: Directory for language '{lang_key}' not found at '{lang_specific_components_dir}'. Skipping this language model."
                 )
-                text_embedder_for_lang._fitted = False  # Correct if no vocab
+                continue
 
-            print(
-                f"  TextEmbedder for {lang_key} loaded. Fitted: {text_embedder_for_lang._fitted}, Vocab size: {len(text_embedder_for_lang.get_feature_names()) if text_embedder_for_lang._fitted else 'N/A'}"
+            model_file = os.path.join(
+                lang_specific_components_dir,
+                cfg.MODEL_FILENAME_TPL.format(lang_key=lang_key),
             )
+            code_gnn_vocab_file = os.path.join(
+                lang_specific_components_dir,
+                cfg.CODE_GNN_VOCAB_FILENAME_TPL.format(lang_key=lang_key),
+            )
+
+            # TextEmbedder is now global, no need to load it per language.
+            # We will pass `loaded_global_text_embedder` to each ConcatEmbedder.
 
             # 2. Load CodeEmbedderGNN's vocabulary and initialize for this language
             print(f"  Loading CodeEmbedderGNN vocabulary from: {code_gnn_vocab_file}")
+            if not os.path.exists(code_gnn_vocab_file):
+                print(
+                    f"  ERROR: CodeEmbedderGNN vocabulary file NOT FOUND for {lang_key}. Skipping this language model."
+                )
+                continue
             with open(code_gnn_vocab_file, "r") as f:
                 code_gnn_vocab_data = json.load(f)
 
@@ -121,10 +140,19 @@ def load_inference_components():
                 f"  CodeEmbedderGNN for {lang_key} initialized and vocabulary loaded."
             )
 
-            # 3. Initialize ConcatEmbedder for this language
+            # 3. Initialize ConcatEmbedder for this language, using the GLOBAL TextEmbedder
+            if (
+                loaded_global_text_embedder is None
+                or not loaded_global_text_embedder._fitted
+            ):
+                print(
+                    f"  ERROR: Global TextEmbedder is not available or not fitted. Cannot create ConcatEmbedder for {lang_key}."
+                )
+                continue  # Skip this language model if global text embedder is problematic
+
             concat_embedder_for_lang = ConcatEmbedder(
                 code_embedder=code_embedder_gnn_for_lang,
-                text_embedder=text_embedder_for_lang,
+                text_embedder=loaded_global_text_embedder,  # Use the global instance
                 use_projection=cfg.CONCAT_USE_PROJECTION_API,
                 projection_dim_scale_factor=cfg.CONCAT_PROJECTION_SCALE_API,
             ).to(device)
@@ -134,6 +162,11 @@ def load_inference_components():
 
             # 4. Initialize SubmissionPredictor and load trained weights for this language
             print(f"  Loading SubmissionPredictor model from: {model_file}")
+            if not os.path.exists(model_file):
+                print(
+                    f"  ERROR: SubmissionPredictor model file NOT FOUND for {lang_key}. Skipping this language model."
+                )
+                continue
             model_instance_for_lang = SubmissionPredictor(
                 concat_embedder=concat_embedder_for_lang,
                 num_verdict_classes=cfg.NUM_VERDICT_CLASSES_API,
@@ -144,41 +177,55 @@ def load_inference_components():
             )
             model_instance_for_lang.eval()
 
-            loaded_models[lang_key] = model_instance_for_lang  # Store in the dictionary
+            loaded_models[lang_key] = model_instance_for_lang
             print(
                 f"  SubmissionPredictor model for {lang_key} loaded and set to eval mode."
             )
 
-        except FileNotFoundError as e:
-            print(
-                f"  ERROR loading components for {lang_key}: File not found - {e}. This language will not be available."
-            )
         except Exception as e:
             print(
                 f"  ERROR loading components for {lang_key}: {type(e).__name__} - {e}. This language will not be available."
             )
             import traceback
 
-            traceback.print_exc()  # Print stack trace for detailed debugging
+            traceback.print_exc()
 
     if not loaded_models:
         print(
             "CRITICAL: No models were loaded successfully. The API will not be able to make predictions."
         )
+    elif loaded_global_text_embedder is None or not loaded_global_text_embedder._fitted:
+        print(
+            "WARNING: Global TextEmbedder failed to load or is not fitted. Predictions might be impaired or fail."
+        )
     else:
         print(
-            f"\n--- API ready. Serving models for languages: {list(loaded_models.keys())} ---"
+            f"\n--- API ready. Serving models for languages: {list(loaded_models.keys())} with a global text embedder. ---"
         )
+
+
+# The /predict endpoint and if __name__ == "__main__": block remain unchanged.
+# Only `load_inference_components` needed adjustment for how TextEmbedder is handled.
+# ... (rest of api.py: @app.route("/predict") and if __name__ == "__main__": from previous version)
 
 
 @app.route("/predict", methods=["POST"])
 def predict():
-    global loaded_models, loaded_preprocessor, loaded_code_normalizer  # loaded_models is now a dict
+    global loaded_models, loaded_preprocessor, loaded_code_normalizer, loaded_global_text_embedder
 
-    if not loaded_models:  # Check if the dictionary is empty
+    if not loaded_models:
         return jsonify({"error": "No models loaded. API is not ready."}), 500
     if not loaded_preprocessor or not loaded_code_normalizer:
         return jsonify({"error": "Preprocessors not loaded. API is not ready."}), 500
+    if not loaded_global_text_embedder or not loaded_global_text_embedder._fitted:
+        return (
+            jsonify(
+                {
+                    "error": "Global TextEmbedder not loaded or not fitted. API cannot make predictions."
+                }
+            ),
+            500,
+        )
 
     try:
         data = request.get_json()
@@ -186,12 +233,14 @@ def predict():
             return jsonify({"error": "No JSON data provided."}), 400
 
         statement = data.get("statement")
-        input_spec = data.get("input_spec", "")  # Default to empty string
-        output_spec = data.get("output_spec", "")  # Default to empty string
+        input_spec = data.get("input_spec", "")
+        output_spec = data.get("output_spec", "")
         code_submission = data.get("code_submission")
         language = data.get("language")
 
-        if not all([statement, code_submission, language]):
+        if not all(
+            [statement is not None, code_submission is not None, language is not None]
+        ):  # Check for presence
             return (
                 jsonify(
                     {
@@ -202,9 +251,8 @@ def predict():
             )
 
         requested_lang_normalized = language.strip().lower()
-
-        # --- Select the correct model for the requested language ---
         selected_model = loaded_models.get(requested_lang_normalized)
+
         if not selected_model:
             return (
                 jsonify(
@@ -217,7 +265,6 @@ def predict():
                 400,
             )
 
-        # 1. Preprocessing
         full_statement_raw = (
             str(statement).strip()
             + "\nInput: "
@@ -225,20 +272,22 @@ def predict():
             + "\nOutput: "
             + str(output_spec).strip()
         )
+        # Preprocessor is global
         processed_statement = loaded_preprocessor.preprocess_text(full_statement_raw)
+        # CodeNormalizer is global
         normalized_code = loaded_code_normalizer.normalize_code(
             str(code_submission), requested_lang_normalized
         )
 
-        # 2. Model Prediction using the selected model
         with torch.no_grad():
-            verdict_logits = selected_model(  # Use the language-specific model
+            # selected_model already contains its ConcatEmbedder, which contains
+            # its CodeEmbedderGNN and the shared loaded_global_text_embedder
+            verdict_logits = selected_model(
                 code_list=[normalized_code],
                 text_list=[processed_statement],
-                lang=requested_lang_normalized,  # Pass the lang to the model's ConcatEmbedder
+                lang=requested_lang_normalized,
             )
 
-        # 3. Process output
         probabilities = torch.softmax(verdict_logits, dim=1).squeeze()
         predicted_id = torch.argmax(probabilities).item()
         predicted_verdict_str = cfg.ID_TO_VERDICT_MAP.get(
@@ -269,7 +318,16 @@ if __name__ == "__main__":
     try:
         load_inference_components()
         if not loaded_models:
-            print("API cannot start as no models were successfully loaded. Check logs.")
+            print(
+                "API cannot start as no models were successfully loaded. Check logs and file paths in api_config.py."
+            )
+        elif not loaded_global_text_embedder or not loaded_global_text_embedder._fitted:
+            print(
+                "API may have issues as Global TextEmbedder failed to load or is not fitted."
+            )
+            app.run(
+                debug=True, host="0.0.0.0", port=5000
+            )  # Still run if some models loaded but text embedder is an issue
         else:
             app.run(debug=True, host="0.0.0.0", port=5000)
     except Exception as startup_error:
