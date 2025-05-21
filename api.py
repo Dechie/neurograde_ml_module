@@ -8,6 +8,7 @@ from flask import Flask, request, jsonify  # Ensure Flask is imported
 import logging  # Import logging
 import sys  # For sys.stdout in logger
 from typing import Dict, Any, Optional, List
+from dotenv import load_dotenv
 
 # --- Import your custom modules ---
 try:
@@ -31,6 +32,26 @@ except ImportError:
     print("CRITICAL ERROR: api_config.py not found. Create it with configurations.")
     exit()
 
+try:
+    from gemini_client import llm as gemini_llm_instance
+
+    if gemini_llm_instance is None and cfg.ENABLE_LLM_REVIEW:
+        print(
+            "WARNING: Gemini LLM instance from gemini_client.py is None, but LLM review is enabled. Review will not be generated."
+        )
+except ImportError as e:
+    print(
+        f"WARNING: Could not import Gemini LLM client from services/gemini_client.py: {e}. LLM review will be disabled."
+    )
+    gemini_llm_instance = None
+except (
+    Exception
+) as e_gemini_init:  # Catch other errors from gemini_client.py during its import/init
+    print(
+        f"ERROR during Gemini LLM client initialization in gemini_client.py: {e_gemini_init}. LLM review will be disabled."
+    )
+    gemini_llm_instance = None
+
 # --- Global variables to hold loaded components ---
 loaded_models: Dict[str, SubmissionPredictor] = {}
 loaded_preprocessor: Optional[Preprocessor] = None
@@ -38,6 +59,8 @@ loaded_code_normalizer: Optional[CodeNormalizer] = None
 loaded_global_text_embedder: Optional[TextEmbedder] = None
 
 app = Flask(__name__)  # Initialize Flask app
+
+load_dotenv()
 
 
 # --- Configure Flask's app.logger directly ---
@@ -265,23 +288,21 @@ def predict():
     # --- Component Availability Checks ---
     critical_component_missing = False
     if not loaded_models:
-        app.logger.error("/predict called but no models are loaded.")
+        app.logger.error("/predict: No models loaded.")
         critical_component_missing = True
     if not loaded_preprocessor or not loaded_code_normalizer:
-        app.logger.error("/predict called but preprocessors are not loaded.")
+        app.logger.error("/predict: Preprocessors not loaded.")
         critical_component_missing = True
     if not loaded_global_text_embedder or not loaded_global_text_embedder._fitted:
-        app.logger.error("/predict called but Global TextEmbedder is not ready.")
+        app.logger.error("/predict: Global TextEmbedder not ready.")
         critical_component_missing = True
+    if cfg.ENABLE_LLM_REVIEW and gemini_llm_instance is None:
+        app.logger.warning(
+            "/predict: LLM review enabled in config, but LLM instance is not available."
+        )
+        # Continue without LLM review for this request, or return error if LLM is critical
     if critical_component_missing:
-        return (
-            jsonify(
-                {
-                    "error": "Core API components not loaded or not ready. Prediction unavailable."
-                }
-            ),
-            503,
-        )  # Service Unavailable
+        return jsonify({"error": "Core API components not ready."}), 503
 
     try:
         data = request.get_json()
@@ -299,9 +320,7 @@ def predict():
         ):
             return (
                 jsonify(
-                    {
-                        "error": "Missing required fields: statement, code_submission, language."
-                    }
+                    {"error": "Missing fields: statement, code_submission, language."}
                 ),
                 400,
             )
@@ -313,9 +332,7 @@ def predict():
             return (
                 jsonify(
                     {
-                        "error": f"Unsupported language '{language}'. This API instance serves: {list(loaded_models.keys())}.",
-                        "requested_language": language,
-                        "available_languages": list(loaded_models.keys()),
+                        "error": f"Unsupported language '{language}'. Available: {list(loaded_models.keys())}."
                     }
                 ),
                 400,
@@ -337,59 +354,106 @@ def predict():
         # 2. Model Prediction
         with torch.no_grad():
             verdict_logits = selected_model(
-                code_list=[normalized_code],
-                text_list=[processed_statement],
-                lang=requested_lang_normalized,
+                [normalized_code], [processed_statement], requested_lang_normalized
             )
 
         # 3. Process output & Calculate Scores
         probabilities_tensor = torch.softmax(verdict_logits, dim=1).squeeze()
         predicted_id = torch.argmax(probabilities_tensor).item()
         predicted_verdict_str = cfg.ID_TO_VERDICT_MAP.get(
-            predicted_id, f"Error: Unmapped ID {predicted_id}"
+            predicted_id, f"UnmappedID_{predicted_id}"
         )
 
-        verdict_probs_map: Dict[str, float] = {}
-        for i, prob_value in enumerate(probabilities_tensor):
-            verdict_name = cfg.ID_TO_VERDICT_MAP.get(i, f"UnknownClass_{i}")
-            verdict_probs_map[verdict_name] = prob_value.item()
+        verdict_probs_map: Dict[str, float] = {
+            cfg.ID_TO_VERDICT_MAP.get(i, f"Cls_{i}"): prob.item()
+            for i, prob in enumerate(probabilities_tensor)
+        }
 
         correctness_score = (
-            1.0 * verdict_probs_map.get("Accepted", 0.0)
-            + 0.5 * verdict_probs_map.get("Presentation Error", 0.0)
-            + 0.3 * verdict_probs_map.get("Wrong Answer", 0.0)
+            1.0 * vpm.get("Accepted", 0)
+            + 0.5 * vpm.get("Presentation Error", 0)
+            + 0.3 * vpm.get("Wrong Answer", 0)
+            for vpm in [verdict_probs_map]
+        )  # Generator for single item
+        correctness_score = next(correctness_score)  # Get value
+
+        efficiency_score_val = (
+            1.0 * vpm.get("Accepted", 0)
+            + 0.9 * vpm.get("Wrong Answer", 0)
+            + 0.9 * vpm.get("Presentation Error", 0)
+            + 0.2 * vpm.get("Runtime Error", 0)
+            + 0.1 * vpm.get("Compile Error", 0)
+            for vpm in [verdict_probs_map]
         )
-        efficiency_score = (
-            1.0 * verdict_probs_map.get("Accepted", 0.0)
-            + 0.9 * verdict_probs_map.get("Wrong Answer", 0.0)
-            + 0.9 * verdict_probs_map.get("Presentation Error", 0.0)
-            + 0.2 * verdict_probs_map.get("Runtime Error", 0.0)
-            + 0.1 * verdict_probs_map.get("Compile Error", 0.0)
-        )
-        efficiency_score -= 1.0 * verdict_probs_map.get(
-            "Time Limit Exceeded", 0.0
-        ) + 1.0 * verdict_probs_map.get("Memory Limit Exceeded", 0.0)
+        efficiency_score_val = next(efficiency_score_val)
+        efficiency_score_val -= 1.0 * verdict_probs_map.get(
+            "Time Limit Exceeded", 0
+        ) + 1.0 * verdict_probs_map.get("Memory Limit Exceeded", 0)
+
         correctness_score = round(max(0.0, min(1.0, correctness_score)), 4)
-        efficiency_score = round(max(-1.0, min(1.0, efficiency_score)), 4)
+        efficiency_score = round(max(-1.0, min(1.0, efficiency_score_val)), 4)
+
+        # --- LLM Review Generation ---
+        llm_review = "LLM review disabled or LLM not available."
+        if cfg.ENABLE_LLM_REVIEW and gemini_llm_instance:
+            try:
+                app.logger.info(
+                    f"Generating LLM review for lang: {language}, verdict: {predicted_verdict_str}"
+                )
+                # Format probabilities for the prompt
+                verdict_probabilities_str_for_prompt = "\n".join(
+                    [
+                        f"- {v_name}: {prob:.2%}"
+                        for v_name, prob in verdict_probs_map.items()
+                    ]
+                )
+
+                prompt = cfg.LLM_REVIEW_PROMPT_TEMPLATE.format(
+                    language=language,
+                    predicted_verdict_string=predicted_verdict_str,
+                    verdict_probabilities_str=verdict_probabilities_str_for_prompt,
+                    correctness_score=correctness_score,
+                    efficiency_score=efficiency_score,
+                )
+
+                # Langchain specific invocation
+                from langchain_core.messages import (
+                    HumanMessage,
+                )  # Assuming HumanMessage is appropriate
+
+                llm_response = gemini_llm_instance.invoke(
+                    [HumanMessage(content=prompt)]
+                )
+                llm_review = (
+                    llm_response.content
+                    if hasattr(llm_response, "content")
+                    else str(llm_response)
+                )
+                app.logger.info(
+                    f"LLM Review Generated: {llm_review[:100]}..."
+                )  # Log first 100 chars
+            except Exception as e_llm:
+                app.logger.error(
+                    f"Error during LLM review generation: {e_llm}", exc_info=True
+                )
+                llm_review = "Error generating LLM review."
 
         response = {
             "requested_language": language,
             "predicted_verdict_id": predicted_id,
             "predicted_verdict_string": predicted_verdict_str,
             "verdict_probabilities": verdict_probs_map,
-            "scores": {
+            "custom_scores": {
                 "correctness_score": correctness_score,
                 "efficiency_score": efficiency_score,
             },
+            "llm_review": llm_review,  # Add LLM review to the response
         }
-        app.logger.info(
-            f"Prediction successful for lang: {language}, predicted: {predicted_verdict_str}"
-        )
         return jsonify(response), 200
 
     except Exception as e:
         app.logger.error(
-            f"Error during prediction for lang '{language if 'language' in locals() else 'unknown'}': {type(e).__name__} - {e}",
+            f"Error during /predict for lang '{language if 'language' in locals() else 'unknown'}': {e}",
             exc_info=True,
         )
         return jsonify({"error": f"An internal error occurred: {str(e)}"}), 500
@@ -424,7 +488,13 @@ if __name__ == "__main__":
             app.logger.info("Starting Flask development server for API...")
             # For development: debug=True, use_reloader=True (but can cause double logging/init)
             # For this controlled setup: debug=False, use_reloader=False to rely on our logger
-            app.run(debug=False, host="0.0.0.0", port=5000, use_reloader=False)
+
+            app.run(
+                debug=False,
+                host="0.0.0.0",
+                port=os.environ.get("PORT"),
+                use_reloader=False,
+            )
         else:
             app.logger.info(
                 "Flask app not started due to critical component loading failures."

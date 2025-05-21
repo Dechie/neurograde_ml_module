@@ -10,6 +10,7 @@ ENV/
 VENV/
 pip-wheel-metadata/
 .DS_Store # macOS specific
+.env
 
 # Project CodeNet Dataset (VERY IMPORTANT - This is likely huge)
 # Assuming your Project_CodeNet directory is at ../Project_CodeNet/
