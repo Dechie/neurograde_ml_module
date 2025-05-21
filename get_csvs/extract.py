@@ -1,16 +1,40 @@
+# extract.py (Strategy 2: Two-Pass Global Quotas)
+
 import pandas as pd
 import os
 import random
 from tqdm import tqdm
-from code_normalizer import CodeNormalizer
+from collections import Counter  # For counting verdict occurrences
+from typing import List, Dict
+import numpy as np
+
+# Assuming CodeNormalizer is in the same directory or path
+try:
+    from code_normalizer import CodeNormalizer
+except ImportError:
+    print(
+        "CRITICAL: CodeNormalizer class not found. Ensure code_normalizer.py is accessible."
+    )
+
+    # Define a dummy if not found so script can be parsed
+    class CodeNormalizer:
+        @staticmethod
+        def normalize_file(filepath, lang=None):
+            return f"Normalized content of {filepath}"
+
+        def normalize_code(self, code, lang=None):
+            return code.strip()
+
 
 # --- Configuration ---
-PROBLEM_STATEMENTS_CSV = "data/final_problem_statements.csv"
-PROJECT_CODENET_BASE_DIR = "../Project_CodeNet/"
+PROBLEM_STATEMENTS_CSV = "data/final_problem_statements.csv"  # Ensure this exists
+PROJECT_CODENET_BASE_DIR = "../Project_CodeNet/"  # Path to the root of CodeNet dataset
 CODENET_METADATA_PER_PROBLEM_DIR = os.path.join(PROJECT_CODENET_BASE_DIR, "metadata")
 CODENET_DATA_DIR = os.path.join(PROJECT_CODENET_BASE_DIR, "data")
 
-OUTPUT_DIR = "data/"
+OUTPUT_DIR = (
+    "data/"  # Where your submissions_Lang.csv and submission_stats_Lang.csv will go
+)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 TARGET_LANGUAGES_INFO = {
@@ -31,7 +55,7 @@ TARGET_LANGUAGES_INFO = {
     },
 }
 
-GLOBAL_TARGET_VERDICTS = [  # Used for initial filtering and as the universe of verdicts
+GLOBAL_TARGET_VERDICTS = [
     "Accepted",
     "Compile Error",
     "Memory Limit Exceeded",
@@ -52,11 +76,36 @@ METADATA_REQUIRED_COLS = [
     "code_size",
 ]
 
-# --- NEW SAMPLING PARAMETER ---
-TARGET_SUBMISSIONS_PER_PROBLEM_LANG = 160
+# --- NEW SAMPLING PARAMETERS FOR STRATEGY 2 ---
+GLOBAL_SAMPLING_TARGETS_PER_LANG = {
+    # These are examples, TUNE THEM based on your data and desired balance!
+    # 'cap_at' is an absolute maximum for a class.
+    "Accepted": {"strategy": "max_samples", "value": 15000},  # Cap majority class
+    "Wrong Answer": {
+        "strategy": "max_samples",
+        "value": 12000,
+    },  # Cap another large class
+    "Time Limit Exceeded": {
+        "strategy": "min_samples_or_all",
+        "value": 40000,
+    },  # Try for 4k, or take all if less
+    "Memory Limit Exceeded": {"strategy": "min_samples_or_all", "value": 30000},
+    "Runtime Error": {"strategy": "min_samples_or_all", "value": 40000},
+    "Compile Error": {"strategy": "min_samples_or_all", "value": 30000},
+    "Presentation Error": {"strategy": "min_samples_or_all", "value": 20000},
+}
+# Fallback for verdicts not explicitly listed above
+DEFAULT_SAMPLING_STRATEGY_PER_LANG = {
+    "strategy": "min_samples_or_all",
+    "value": 1000,
+}  # Ensure even unlisted get some representation
+
+# Maximum total submissions to aim for per language (optional, can act as a global cap)
+# Set to None if you want the sum of GLOBAL_SAMPLING_TARGETS_PER_LANG to dictate the total
+MAX_TOTAL_SAMPLES_PER_LANGUAGE = None  # e.g., 40000
 
 
-# --- Helper Functions --- (Keep these as they are)
+# --- Helper Functions ---
 def map_codenet_language_to_target(codenet_lang_str):
     if not isinstance(codenet_lang_str, str):
         return None
@@ -84,115 +133,10 @@ def map_codenet_status_to_target_verdict(codenet_status_str):
     if codenet_status_str == "Time Limit Exceeded":
         return "Time Limit Exceeded"
     if codenet_status_str.startswith("Runtime Error"):
-        return "Runtime Error"
+        return "Runtime Error"  # Handles variants
     if codenet_status_str == "Wrong Answer":
         return "Wrong Answer"
     return None
-
-
-def get_stratified_sample_counts(
-    verdict_counts: dict, total_target_samples: int
-) -> dict:
-    """
-    Calculates the number of samples for each verdict category using stratified sampling
-    to meet a total target, considering availability.
-    Args:
-        verdict_counts: Dict of {verdict_name: count_available}.
-        total_target_samples: The desired total number of samples across all verdicts.
-    Returns:
-        Dict of {verdict_name: num_to_sample}.
-    """
-    # Filter out verdicts with zero counts to avoid division by zero
-    # and to only consider strata that actually exist.
-    active_verdict_counts = {v: c for v, c in verdict_counts.items() if c > 0}
-    if not active_verdict_counts:
-        return {
-            v: 0 for v in verdict_counts.keys()
-        }  # Return all zeros if no active verdicts
-
-    total_available_for_active_verdicts = sum(active_verdict_counts.values())
-
-    # If total available is less than or equal to the target, take all available
-    if total_available_for_active_verdicts <= total_target_samples:
-        return active_verdict_counts.copy()  # Take all available from active verdicts
-
-    # Calculate ideal (float) number of samples based on proportion
-    ideal_samples = {}
-    for verdict, count in active_verdict_counts.items():
-        proportion = count / total_available_for_active_verdicts
-        ideal_samples[verdict] = proportion * total_target_samples
-
-    # Allocate samples: initial allocation is floor, then distribute remainders
-    # based on largest fractional parts, while respecting availability.
-
-    allocated_samples = {v: 0 for v in active_verdict_counts.keys()}
-
-    # Phase 1: Hamilton method / largest remainder method for initial distribution
-    # Calculate initial integer allocations (floor) and remainders
-    initial_allocations = {v: int(s) for v, s in ideal_samples.items()}
-    remainders = {v: s - initial_allocations[v] for v, s in ideal_samples.items()}
-
-    current_total_allocated = sum(initial_allocations.values())
-    num_remaining_to_allocate = total_target_samples - current_total_allocated
-
-    # Sort verdicts by their remainders in descending order to prioritize
-    sorted_verdicts_by_remainder = sorted(
-        remainders.keys(), key=lambda v: remainders[v], reverse=True
-    )
-
-    for verdict in sorted_verdicts_by_remainder:
-        if num_remaining_to_allocate <= 0:
-            break
-        # Can only increment if we don't exceed available for this verdict
-        if initial_allocations[verdict] < active_verdict_counts[verdict]:
-            initial_allocations[verdict] += 1
-            num_remaining_to_allocate -= 1
-
-    # Phase 2: Adjust allocations to not exceed available counts
-    # This step is crucial. After proportional allocation, ensure no category asks for more than it has.
-    # Redistribute any "excess" demand.
-
-    final_samples_to_take = {}
-    current_total_taken = 0
-
-    # Tentatively take the proportionally allocated amounts, capped by availability
-    for verdict in active_verdict_counts.keys():  # Iterate in a consistent order
-        final_samples_to_take[verdict] = min(
-            initial_allocations.get(verdict, 0), active_verdict_counts[verdict]
-        )
-        current_total_taken += final_samples_to_take[verdict]
-
-    # If we are short of the target due to capping by availability, try to top up from
-    # other verdicts that have more available than their current allocation.
-    if current_total_taken < total_target_samples:
-        shortfall = total_target_samples - current_total_taken
-        # Sort by who has the most "room" (available - current_allocation)
-        # and hasn't hit their ideal proportional share yet (or has more available)
-
-        # Create a list of (verdict, room_to_add)
-        potential_top_up_sources = []
-        for verdict in active_verdict_counts.keys():
-            room = active_verdict_counts[verdict] - final_samples_to_take[verdict]
-            if room > 0:
-                potential_top_up_sources.append((verdict, room))
-
-        # Sort by room (descending) to prioritize those with more capacity
-        potential_top_up_sources.sort(key=lambda x: x[1], reverse=True)
-
-        for verdict, room in potential_top_up_sources:
-            if shortfall <= 0:
-                break
-            can_add = min(shortfall, room)
-            final_samples_to_take[verdict] += can_add
-            shortfall -= can_add
-            current_total_taken += (
-                can_add  # Not strictly needed here as shortfall tracks
-            )
-
-    # Ensure all original GLOBAL_TARGET_VERDICTS keys are present, with 0 if not active
-    result = {v: 0 for v in verdict_counts.keys()}
-    result.update(final_samples_to_take)
-    return result
 
 
 # --- Main Logic ---
@@ -213,11 +157,15 @@ def main():
         return
 
     all_problem_metadata_dfs = []
-    print("Loading CodeNet metadata...")
-    for p_id in tqdm(user_problem_ids, desc="Loading metadata per problem"):
+    print("Loading CodeNet metadata (this might take a while)...")
+    for p_id in tqdm(
+        user_problem_ids, desc="Loading metadata per problem"
+    ):  # tqdm for metadata loading
         fpath = os.path.join(CODENET_METADATA_PER_PROBLEM_DIR, f"{p_id}.csv")
         try:
-            all_problem_metadata_dfs.append(pd.read_csv(fpath, low_memory=False))
+            all_problem_metadata_dfs.append(
+                pd.read_csv(fpath, usecols=METADATA_REQUIRED_COLS, low_memory=False)
+            )
         except FileNotFoundError:
             pass
         except Exception as e:
@@ -228,7 +176,7 @@ def main():
         return
     codenet_full_meta_df = pd.concat(all_problem_metadata_dfs, ignore_index=True)
     print(
-        f"Loaded metadata for {codenet_full_meta_df['problem_id'].nunique()} problems, {len(codenet_full_meta_df)} entries."
+        f"Loaded metadata for {codenet_full_meta_df['problem_id'].nunique()} problems, {len(codenet_full_meta_df)} total entries."
     )
 
     print("Preprocessing CodeNet metadata...")
@@ -238,150 +186,211 @@ def main():
     codenet_full_meta_df["target_verdict"] = codenet_full_meta_df["status"].apply(
         map_codenet_status_to_target_verdict
     )
-
     codenet_processed_meta_df = codenet_full_meta_df.dropna(
-        subset=METADATA_REQUIRED_COLS + ["target_language", "target_verdict"]
+        subset=["target_language", "target_verdict"]
     ).copy()
     codenet_processed_meta_df = codenet_processed_meta_df[
         codenet_processed_meta_df["target_verdict"].isin(GLOBAL_TARGET_VERDICTS)
     ]
     print(
-        f"Filtered to {len(codenet_processed_meta_df)} relevant CodeNet metadata entries."
+        f"Filtered to {len(codenet_processed_meta_df)} relevant CodeNet metadata entries with target verdicts and languages."
     )
-
     if codenet_processed_meta_df.empty:
-        print("No relevant CodeNet submissions found. Exiting.")
+        print("No relevant CodeNet submissions found after initial filter. Exiting.")
         return
 
+    code_normalizer_instance = CodeNormalizer()
+
     for lang_name_key, lang_details in TARGET_LANGUAGES_INFO.items():
-        target_lang_for_normalizer = lang_name_key
         code_output_csv, stats_output_csv = (
             lang_details["code_csv"],
             lang_details["stats_csv"],
         )
         codenet_data_subdir = lang_details["codenet_dir_name"]
 
-        print(f"\n--- Processing language: {target_lang_for_normalizer} ---")
-        collected_code_data, collected_stats_data = [], []
+        print(f"\n--- Processing language: {lang_name_key} ---")
 
         lang_specific_meta_df = codenet_processed_meta_df[
-            codenet_processed_meta_df["target_language"] == target_lang_for_normalizer
+            codenet_processed_meta_df["target_language"] == lang_name_key
         ].copy()
         if lang_specific_meta_df.empty:
-            print(f"No submissions for '{target_lang_for_normalizer}'. Skipping.")
+            print(
+                f"No submissions found for '{lang_name_key}' after filtering. Skipping."
+            )
             continue
 
-        for p_id in tqdm(
-            user_problem_ids, desc=f"Problems for {target_lang_for_normalizer}"
-        ):
-            problem_lang_submissions_df = lang_specific_meta_df[
-                lang_specific_meta_df["problem_id"] == p_id
-            ]
-            if problem_lang_submissions_df.empty:
-                continue
+        print(
+            f"Found {len(lang_specific_meta_df)} total submissions for {lang_name_key}."
+        )
 
-            # --- STRATIFIED SAMPLING LOGIC ---
-            # 1. Get current counts of each verdict for this problem/language
-            current_verdict_counts = {}
-            for (
-                v_cat
-            ) in (
-                GLOBAL_TARGET_VERDICTS
-            ):  # Ensure all global verdicts are considered for counts dict
-                current_verdict_counts[v_cat] = len(
-                    problem_lang_submissions_df[
-                        problem_lang_submissions_df["target_verdict"] == v_cat
-                    ]
-                )
+        # 1. Calculate current global availability for this language
+        global_verdict_availability = Counter(lang_specific_meta_df["target_verdict"])
+        print(f"Global verdict availability for {lang_name_key}:")
+        for verdict, count in global_verdict_availability.items():
+            print(f"  {verdict}: {count}")
 
-            # 2. Calculate how many to sample from each verdict to reach TARGET_SUBMISSIONS_PER_PROBLEM_LANG
-            # The function will handle cases where total available < target.
-            num_to_sample_per_verdict = get_stratified_sample_counts(
-                current_verdict_counts, TARGET_SUBMISSIONS_PER_PROBLEM_LANG
+        # 2. Determine target number of samples for each verdict
+        target_samples_per_verdict_for_lang: Dict[str, int] = {}
+        max_class_count = (
+            max(global_verdict_availability.values())
+            if global_verdict_availability
+            else 0
+        )
+
+        for verdict in GLOBAL_TARGET_VERDICTS:
+            config = GLOBAL_SAMPLING_TARGETS_PER_LANG.get(
+                verdict, DEFAULT_SAMPLING_STRATEGY_PER_LANG
             )
-            # --- END OF STRATIFIED SAMPLING LOGIC ---
+            available_for_this_verdict = global_verdict_availability.get(verdict, 0)
+            target_for_this_verdict = 0
+            if available_for_this_verdict == 0:
+                target_samples_per_verdict_for_lang[verdict] = 0
+                continue
+            if config["strategy"] == "min_samples_or_all":
+                target_for_this_verdict = min(
+                    config["value"], available_for_this_verdict
+                )
+            elif config["strategy"] == "max_samples":
+                target_for_this_verdict = min(
+                    config["value"], available_for_this_verdict
+                )
+            elif (
+                config["strategy"] == "target_proportion_of_max_class"
+                and max_class_count > 0
+            ):
+                target_for_this_verdict = int(config["value"] * max_class_count)
+                target_for_this_verdict = min(
+                    target_for_this_verdict, available_for_this_verdict
+                )
+                if "cap_at" in config:
+                    target_for_this_verdict = min(
+                        target_for_this_verdict, config["cap_at"]
+                    )
+            elif config["strategy"] == "as_is":
+                target_for_this_verdict = available_for_this_verdict
+            target_samples_per_verdict_for_lang[verdict] = target_for_this_verdict
 
-            total_sampled_for_problem = 0  # For verification
-            for verdict_category, num_to_sample in num_to_sample_per_verdict.items():
-                if num_to_sample == 0:
+        print(f"Global sampling targets for {lang_name_key}:")
+        for verdict, count in target_samples_per_verdict_for_lang.items():
+            print(
+                f"  {verdict}: {count} (Available: {global_verdict_availability.get(verdict, 0)})"
+            )
+
+        current_total_targeted = sum(target_samples_per_verdict_for_lang.values())
+        if (
+            MAX_TOTAL_SAMPLES_PER_LANGUAGE
+            and current_total_targeted > MAX_TOTAL_SAMPLES_PER_LANGUAGE
+        ):
+            print(
+                f"Total targeted ({current_total_targeted}) exceeds MAX_TOTAL_SAMPLES ({MAX_TOTAL_SAMPLES_PER_LANGUAGE}). Scaling down."
+            )
+            scale_factor = MAX_TOTAL_SAMPLES_PER_LANGUAGE / current_total_targeted
+            for v_key in target_samples_per_verdict_for_lang:
+                target_samples_per_verdict_for_lang[v_key] = int(
+                    target_samples_per_verdict_for_lang[v_key] * scale_factor
+                )
+            print(f"Scaled global sampling targets for {lang_name_key}:")
+            for v, c in target_samples_per_verdict_for_lang.items():
+                print(f"  {v}: {c}")
+
+        # 3. Second Pass: Collect submissions
+        collected_code_data: List[Dict] = []
+        collected_stats_data: List[Dict] = []
+        indices_per_verdict: Dict[str, list] = {v: [] for v in GLOBAL_TARGET_VERDICTS}
+        for index, row in lang_specific_meta_df.iterrows():
+            indices_per_verdict[row["target_verdict"]].append(index)
+        for verdict in indices_per_verdict:
+            random.shuffle(indices_per_verdict[verdict])
+
+        final_selected_indices = []
+        for verdict, target_count in target_samples_per_verdict_for_lang.items():
+            available_indices_for_verdict = indices_per_verdict.get(verdict, [])
+            final_selected_indices.extend(available_indices_for_verdict[:target_count])
+
+        if not final_selected_indices:
+            print(
+                f"No samples selected for {lang_name_key} based on global targets. Skipping file processing."
+            )
+            continue
+
+        sampled_lang_df = lang_specific_meta_df.loc[final_selected_indices].copy()
+        sampled_lang_df = sampled_lang_df.sample(
+            frac=1, random_state=RANDOM_SEED
+        ).reset_index(drop=True)
+        print(
+            f"Globally sampled {len(sampled_lang_df)} submissions for {lang_name_key} to process."
+        )
+
+        # --- WRAP THIS LOOP WITH TQDM ---
+        for _, submission_row in tqdm(
+            sampled_lang_df.iterrows(),
+            total=len(sampled_lang_df),
+            desc=f"Extracting files for {lang_name_key}",
+        ):
+            p_id, s_id, s_fname_ext = (
+                submission_row["problem_id"],
+                submission_row["submission_id"],
+                submission_row["filename_ext"],
+            )
+            s_fname_full = str(s_id) + "." + str(s_fname_ext)
+            verdict_category = submission_row["target_verdict"]
+
+            f_path = os.path.join(
+                CODENET_DATA_DIR, str(p_id), codenet_data_subdir, s_fname_full
+            )
+
+            try:
+                normalized_code = code_normalizer_instance.normalize_file(
+                    f_path, lang=lang_name_key
+                )
+                if normalized_code is None or not normalized_code.strip():
                     continue
 
-                verdict_specific_df = problem_lang_submissions_df[
-                    problem_lang_submissions_df["target_verdict"] == verdict_category
-                ]
-
-                # Ensure we don't try to sample more than available (should be handled by get_stratified_sample_counts)
-                actual_num_to_sample = min(num_to_sample, len(verdict_specific_df))
-
-                if actual_num_to_sample > 0:
-                    sampled_df = verdict_specific_df.sample(
-                        n=actual_num_to_sample, random_state=RANDOM_SEED
-                    )
-                    total_sampled_for_problem += len(sampled_df)
-
-                    for _, submission_row in sampled_df.iterrows():
-                        s_id, s_fname = (
-                            submission_row["submission_id"],
-                            submission_row["submission_id"]
-                            + "."
-                            + submission_row["filename_ext"],
-                        )
-
-                        f_path = os.path.join(
-                            CODENET_DATA_DIR,
-                            p_id,
-                            codenet_data_subdir,
-                            s_fname,
-                        )
-
-                        try:
-                            norm_code = CodeNormalizer.normalize_file(f_path)
-                            collected_code_data.append(
-                                {
-                                    "problem_id": p_id,
-                                    "submission_file": s_fname,
-                                    "code": norm_code,
-                                }
-                            )
-                            collected_stats_data.append(
-                                {
-                                    "problem_id": p_id,
-                                    "submission_id": s_id,
-                                    "language": target_lang_for_normalizer,
-                                    "verdict": verdict_category,
-                                    "runtime": submission_row["cpu_time"],
-                                    "memory": submission_row["memory"],
-                                    "code_size": submission_row["code_size"],
-                                }
-                            )
-                        except FileNotFoundError:
-                            pass
-                        except ValueError:
-                            pass
-                        except Exception as e:
-                            print(f"Warning: Error processing {f_path}: {e}")
-
-            # print(
-            #     f"Problem {p_id} ({target_lang_for_normalizer}): Target {TARGET_SUBMISSIONS_PER_PROBLEM_LANG}, Actual sampled: {total_sampled_for_problem}"
-            # )
+                collected_code_data.append(
+                    {
+                        "problem_id": str(p_id),
+                        "submission_file": s_fname_full,
+                        "code": normalized_code,
+                    }
+                )
+                collected_stats_data.append(
+                    {
+                        "problem_id": str(p_id),
+                        "submission_id": str(s_id),
+                        "language": lang_name_key,
+                        "verdict": verdict_category,
+                        "runtime": submission_row["cpu_time"],
+                        "memory": submission_row["memory"],
+                        "code_size": submission_row["code_size"],
+                    }
+                )
+            except FileNotFoundError:
+                pass
+            except ValueError:
+                pass
+            except Exception as e:
+                print(
+                    f"Warning: Unexpected error processing {f_path}: {type(e).__name__} - {e}"
+                )
+        # --- END OF TQDM WRAPPED LOOP ---
 
         if collected_code_data:
-            pd.DataFrame(collected_code_data).to_csv(
-                code_output_csv, index=False, encoding="utf-8"
-            )
-            print(f"Saved {len(collected_code_data)} code entries to {code_output_csv}")
+            df_c = pd.DataFrame(collected_code_data)
+            df_c.to_csv(code_output_csv, index=False, encoding="utf-8")
+            print(f"Saved {len(df_c)} code entries to {code_output_csv}")
         else:
-            print(f"No code entries for {target_lang_for_normalizer}.")
+            print(f"No code entries collected for {lang_name_key}.")
 
         if collected_stats_data:
-            pd.DataFrame(collected_stats_data).to_csv(
-                stats_output_csv, index=False, encoding="utf-8"
-            )
-            print(
-                f"Saved {len(collected_stats_data)} stats entries to {stats_output_csv}"
-            )
+            df_s = pd.DataFrame(collected_stats_data)
+            df_s_counts = Counter(df_s["verdict"])
+            print(f"Final verdict distribution for {lang_name_key} in stats file:")
+            for v, c in df_s_counts.items():
+                print(f"  {v}: {c}")
+            df_s.to_csv(stats_output_csv, index=False, encoding="utf-8")
+            print(f"Saved {len(df_s)} stats entries to {stats_output_csv}")
         else:
-            print(f"No stats entries for {target_lang_for_normalizer}.")
+            print(f"No stats entries collected for {lang_name_key}.")
 
     print("\nAll processing finished.")
 

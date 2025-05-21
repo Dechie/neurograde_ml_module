@@ -59,3 +59,11 @@ dist/
 # Logs
 *.log
 training_logs/
+
+# Training checkpoints
+training_checkpoint_python.pth
+training_checkpoint_cpp.pth
+training_checkpoint_java.pth
+
+# images
+*.png

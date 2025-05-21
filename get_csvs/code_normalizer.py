@@ -63,26 +63,22 @@ class CodeNormalizer:
         return cleaned
 
     @classmethod
-    def normalize_file(cls, filepath: str) -> str:
-        """
-        Normalize a source code file by path, auto-detecting language from extension.
-
-        Args:
-            filepath: Path to the source file.
-
-        Returns:
-            Normalized code string.
-        """
-        p = Path(filepath)
-        ext = p.suffix
-        # Detect language by extension
-        lang = None
-        for key, extset in _EXTS_LANG.items():
-            if ext in extset:
-                lang = key
-                break
-        if lang is None:
-            raise ValueError(f"Unsupported file extension: {ext}")
-
-        content = p.read_text(encoding="utf-8", errors="ignore")
-        return cls.normalize_code(content, lang)
+    def normalize_file(self, filepath: str, lang: str) -> str:
+        """Reads a file, normalizes its content using the given language, and returns the normalized code string."""
+        try:
+            with open(
+                filepath, "r", encoding="utf-8", errors="ignore"
+            ) as f:  # Add errors='ignore' for robustness
+                code = f.read()
+            # Now pass the lang argument to normalize_code
+            return self.normalize_code(code, lang)
+        except FileNotFoundError:
+            # print(
+            #     f"Warning (normalize_file): File not found at {filepath}. Returning empty string."
+            # )
+            return ""  # Return empty string for FileNotFoundError to be skipped in extract.py
+        except Exception as e:
+            # print(
+            #     f"Warning (normalize_file): Error reading/normalizing file {filepath}: {e}. Returning empty string."
+            # )
+            return ""  # Return empty for other errors too
