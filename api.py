@@ -1,8 +1,12 @@
+# api.py (Full Code - Refined Logging, Global TextEmbedder, Custom Scores)
+
 import os
 import json
 import joblib
 import torch
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify  # Ensure Flask is imported
+import logging  # Import logging
+import sys  # For sys.stdout in logger
 from typing import Dict, Any, Optional, List
 
 # --- Import your custom modules ---
@@ -10,12 +14,13 @@ try:
     from preprocessor import Preprocessor
     from code_normalizer import CodeNormalizer
     from text_embedder import TextEmbedder
-    from code_embedder import CodeEmbedderGNN  # Corrected import
+    from code_embedder import CodeEmbedderGNN  # Assuming this is your filename
     from concat_embedder import ConcatEmbedder
     from submission_predictor import SubmissionPredictor
 except ImportError as e:
+    # Basic print for critical startup errors before logger is configured
     print(
-        f"CRITICAL API IMPORT ERROR: {e}. Ensure all component .py files are accessible."
+        f"CRITICAL API IMPORT ERROR: {e}. Ensure all component .py files are accessible and dependencies installed."
     )
     exit()
 
@@ -26,76 +31,130 @@ except ImportError:
     print("CRITICAL ERROR: api_config.py not found. Create it with configurations.")
     exit()
 
+# --- Global variables to hold loaded components ---
 loaded_models: Dict[str, SubmissionPredictor] = {}
 loaded_preprocessor: Optional[Preprocessor] = None
 loaded_code_normalizer: Optional[CodeNormalizer] = None
-# --- Global TextEmbedder instance ---
 loaded_global_text_embedder: Optional[TextEmbedder] = None
 
-app = Flask(__name__)
+app = Flask(__name__)  # Initialize Flask app
+
+
+# --- Configure Flask's app.logger directly ---
+def setup_api_logger(flask_app_instance, log_file_path="api_log.txt"):
+    """Configures the Flask app's logger for file and console output."""
+    # Ensure log directory exists
+    log_dir = os.path.dirname(log_file_path)
+    if log_dir and not os.path.exists(log_dir):  # Check if log_dir is not empty string
+        os.makedirs(log_dir, exist_ok=True)
+
+    # Remove any existing handlers from app.logger to prevent duplicates
+    # This is important if app.run(debug=True) was used before or if other libs add handlers
+    for handler in list(flask_app_instance.logger.handlers):
+        flask_app_instance.logger.removeHandler(handler)
+
+    # Also, stop propagation to the root logger if it has handlers (common cause of duplicates)
+    flask_app_instance.logger.propagate = False
+    logging.getLogger("werkzeug").propagate = False  # Quiet down Werkzeug if needed
+
+    flask_app_instance.logger.setLevel(logging.INFO)
+
+    # File Handler for app.logger
+    try:
+        file_handler = logging.FileHandler(log_file_path, mode="a")  # Append mode
+        file_formatter = logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        )
+        file_handler.setFormatter(file_formatter)
+        flask_app_instance.logger.addHandler(file_handler)
+    except Exception as e:
+        print(
+            f"Warning: Could not set up file logger for API at {log_file_path}. Error: {e}"
+        )
+
+    # Console Handler for app.logger
+    console_handler = logging.StreamHandler(sys.stdout)  # Explicitly use sys.stdout
+    console_formatter = logging.Formatter(
+        "%(asctime)s - %(levelname)s - [API] - %(message)s"
+    )
+    console_handler.setFormatter(console_formatter)
+    flask_app_instance.logger.addHandler(console_handler)
+
+    flask_app_instance.logger.info(
+        "Flask app logger configured. Logging to console and file."
+    )
 
 
 def load_inference_components():
+    """
+    Loads all necessary components for inference.
+    Uses app.logger for logging within this function.
+    """
     global loaded_models, loaded_preprocessor, loaded_code_normalizer, loaded_global_text_embedder
 
-    print("--- Loading inference components (with Global TextEmbedder) ---")
+    app.logger.info("--- Loading inference components (with Global TextEmbedder) ---")
     device = torch.device(cfg.DEVICE_API)
 
-    loaded_preprocessor = Preprocessor()
-    loaded_code_normalizer = CodeNormalizer()
-    print("Shared Preprocessor and CodeNormalizer initialized.")
+    try:
+        loaded_preprocessor = Preprocessor()
+        loaded_code_normalizer = CodeNormalizer()
+        app.logger.info("Shared Preprocessor and CodeNormalizer initialized.")
+    except Exception as e:
+        app.logger.error(
+            f"Failed to initialize Preprocessor/CodeNormalizer: {e}", exc_info=True
+        )
+        # Decide if API can run without these. If critical, raise or exit.
+        # For now, we'll let it try to continue but predict will likely fail.
 
     # --- 1. Load the GLOBALLY FITTED TextEmbedder's TfidfVectorizer ---
-    print(
+    app.logger.info(
         f"Loading Global TextEmbedder TfidfVectorizer from: {cfg.GLOBAL_TEXT_EMBEDDER_VECTORIZER_FILE}"
     )
     try:
         if not os.path.exists(cfg.GLOBAL_TEXT_EMBEDDER_VECTORIZER_FILE):
-            print(
-                f"ERROR: Global TextEmbedder vectorizer file NOT FOUND at '{cfg.GLOBAL_TEXT_EMBEDDER_VECTORIZER_FILE}'. API cannot effectively start for text features."
-            )
-            raise FileNotFoundError  # Or handle more gracefully by disabling text features
+            msg = f"ERROR: Global TextEmbedder vectorizer file NOT FOUND at '{cfg.GLOBAL_TEXT_EMBEDDER_VECTORIZER_FILE}'."
+            app.logger.error(msg)
+            raise FileNotFoundError(msg)  # Raise to stop if critical
 
         tfidf_vectorizer_fitted = joblib.load(cfg.GLOBAL_TEXT_EMBEDDER_VECTORIZER_FILE)
         loaded_global_text_embedder = TextEmbedder(
             vectorizer_model=tfidf_vectorizer_fitted
         )
-        loaded_global_text_embedder._fitted = (
-            True  # Assume joblib restores a fitted model
-        )
+        loaded_global_text_embedder._fitted = True
 
         if not (
             hasattr(loaded_global_text_embedder.vectorizer, "vocabulary_")
             and loaded_global_text_embedder.vectorizer.vocabulary_
         ):
-            print(
-                f"WARNING: Loaded Global TfidfVectorizer does not appear to be fitted (no vocabulary)."
+            app.logger.warning(
+                "Loaded Global TfidfVectorizer does not appear to be fitted (no vocabulary)."
             )
-            loaded_global_text_embedder._fitted = False
+            loaded_global_text_embedder._fitted = False  # Mark as not properly fitted
 
-        print(
+        app.logger.info(
             f"Global TextEmbedder loaded. Fitted: {loaded_global_text_embedder._fitted}, Vocab size: {len(loaded_global_text_embedder.get_feature_names()) if loaded_global_text_embedder._fitted else 'N/A'}"
         )
     except Exception as e:
-        print(
-            f"ERROR: Failed to load Global TextEmbedder vectorizer: {e}. Text embedding will not work."
+        app.logger.error(
+            f"Failed to load Global TextEmbedder vectorizer: {e}. Text embedding might not work.",
+            exc_info=True,
         )
-        # loaded_global_text_embedder will remain None or in an unfitted state
-        # Subsequent ConcatEmbedder initializations might warn or fail if they strictly need a fitted TextEmbedder dimension.
-        # For robustness, we could create a dummy unfitted TextEmbedder here.
         if loaded_global_text_embedder is None:
-            loaded_global_text_embedder = TextEmbedder()  # Create a non-fitted instance
-            print("Created a default, non-fitted Global TextEmbedder as fallback.")
+            loaded_global_text_embedder = TextEmbedder()
+        app.logger.warning(
+            "Created a default, non-fitted Global TextEmbedder as fallback."
+        )
 
+    # --- Loop through specified languages to load their specific models ---
     for lang_key in cfg.API_SUPPORTED_LANGUAGES.keys():
-        print(f"\n--- Loading language-specific components for: {lang_key} ---")
+        app.logger.info(f"--- Loading language-specific components for: {lang_key} ---")
         try:
             lang_specific_components_dir = os.path.join(
                 cfg.SAVED_COMPONENTS_BASE_DIR_API, lang_key
             )
             if not os.path.isdir(lang_specific_components_dir):
-                print(
-                    f"  WARNING: Directory for language '{lang_key}' not found at '{lang_specific_components_dir}'. Skipping this language model."
+                app.logger.warning(
+                    f"Directory for language '{lang_key}' not found at '{lang_specific_components_dir}'. Skipping model."
                 )
                 continue
 
@@ -108,14 +167,13 @@ def load_inference_components():
                 cfg.CODE_GNN_VOCAB_FILENAME_TPL.format(lang_key=lang_key),
             )
 
-            # TextEmbedder is now global, no need to load it per language.
-            # We will pass `loaded_global_text_embedder` to each ConcatEmbedder.
-
-            # 2. Load CodeEmbedderGNN's vocabulary and initialize for this language
-            print(f"  Loading CodeEmbedderGNN vocabulary from: {code_gnn_vocab_file}")
+            # 2. CodeEmbedderGNN
+            app.logger.info(
+                f"Loading CodeEmbedderGNN vocabulary from: {code_gnn_vocab_file}"
+            )
             if not os.path.exists(code_gnn_vocab_file):
-                print(
-                    f"  ERROR: CodeEmbedderGNN vocabulary file NOT FOUND for {lang_key}. Skipping this language model."
+                app.logger.error(
+                    f"CodeEmbedderGNN vocabulary file NOT FOUND for {lang_key} at '{code_gnn_vocab_file}'. Skipping model."
                 )
                 continue
             with open(code_gnn_vocab_file, "r") as f:
@@ -136,35 +194,34 @@ def load_inference_components():
             code_embedder_gnn_for_lang.next_node_type_id = code_gnn_vocab_data[
                 "next_node_type_id"
             ]
-            print(
-                f"  CodeEmbedderGNN for {lang_key} initialized and vocabulary loaded."
+            app.logger.info(
+                f"CodeEmbedderGNN for {lang_key} initialized and vocabulary loaded."
             )
 
-            # 3. Initialize ConcatEmbedder for this language, using the GLOBAL TextEmbedder
+            # 3. ConcatEmbedder
             if (
                 loaded_global_text_embedder is None
                 or not loaded_global_text_embedder._fitted
             ):
-                print(
-                    f"  ERROR: Global TextEmbedder is not available or not fitted. Cannot create ConcatEmbedder for {lang_key}."
+                app.logger.error(
+                    f"Global TextEmbedder not ready. Cannot create ConcatEmbedder for {lang_key}."
                 )
-                continue  # Skip this language model if global text embedder is problematic
-
+                continue
             concat_embedder_for_lang = ConcatEmbedder(
                 code_embedder=code_embedder_gnn_for_lang,
-                text_embedder=loaded_global_text_embedder,  # Use the global instance
+                text_embedder=loaded_global_text_embedder,
                 use_projection=cfg.CONCAT_USE_PROJECTION_API,
                 projection_dim_scale_factor=cfg.CONCAT_PROJECTION_SCALE_API,
             ).to(device)
-            print(
-                f"  ConcatEmbedder for {lang_key} initialized. Final dim: {concat_embedder_for_lang.final_dim}"
+            app.logger.info(
+                f"ConcatEmbedder for {lang_key} initialized. Final dim: {concat_embedder_for_lang.final_dim}"
             )
 
-            # 4. Initialize SubmissionPredictor and load trained weights for this language
-            print(f"  Loading SubmissionPredictor model from: {model_file}")
+            # 4. SubmissionPredictor
+            app.logger.info(f"Loading SubmissionPredictor model from: {model_file}")
             if not os.path.exists(model_file):
-                print(
-                    f"  ERROR: SubmissionPredictor model file NOT FOUND for {lang_key}. Skipping this language model."
+                app.logger.error(
+                    f"SubmissionPredictor model file NOT FOUND for {lang_key} at '{model_file}'. Skipping model."
                 )
                 continue
             model_instance_for_lang = SubmissionPredictor(
@@ -176,56 +233,55 @@ def load_inference_components():
                 torch.load(model_file, map_location=device)
             )
             model_instance_for_lang.eval()
-
             loaded_models[lang_key] = model_instance_for_lang
-            print(
-                f"  SubmissionPredictor model for {lang_key} loaded and set to eval mode."
+            app.logger.info(
+                f"SubmissionPredictor model for {lang_key} loaded and set to eval mode."
             )
-
         except Exception as e:
-            print(
-                f"  ERROR loading components for {lang_key}: {type(e).__name__} - {e}. This language will not be available."
+            app.logger.error(
+                f"ERROR loading components for {lang_key}: {type(e).__name__} - {e}. This language will not be available.",
+                exc_info=True,
             )
-            import traceback
-
-            traceback.print_exc()
 
     if not loaded_models:
-        print(
-            "CRITICAL: No models were loaded successfully. The API will not be able to make predictions."
+        app.logger.critical(
+            "CRITICAL: No models were loaded successfully. API will not make predictions."
         )
     elif loaded_global_text_embedder is None or not loaded_global_text_embedder._fitted:
-        print(
-            "WARNING: Global TextEmbedder failed to load or is not fitted. Predictions might be impaired or fail."
+        app.logger.warning(
+            "WARNING: Global TextEmbedder failed. Predictions may be impaired."
         )
     else:
-        print(
-            f"\n--- API ready. Serving models for languages: {list(loaded_models.keys())} with a global text embedder. ---"
+        app.logger.info(
+            f"--- API ready. Serving models for languages: {list(loaded_models.keys())} with a global text embedder. ---"
         )
-
-
-# The /predict endpoint and if __name__ == "__main__": block remain unchanged.
-# Only `load_inference_components` needed adjustment for how TextEmbedder is handled.
-# ... (rest of api.py: @app.route("/predict") and if __name__ == "__main__": from previous version)
 
 
 @app.route("/predict", methods=["POST"])
 def predict():
-    global loaded_models, loaded_preprocessor, loaded_code_normalizer, loaded_global_text_embedder
+    global loaded_models, loaded_preprocessor, loaded_code_normalizer
+    # Global text embedder is used internally by the ConcatEmbedder within the selected_model
 
+    # --- Component Availability Checks ---
+    critical_component_missing = False
     if not loaded_models:
-        return jsonify({"error": "No models loaded. API is not ready."}), 500
+        app.logger.error("/predict called but no models are loaded.")
+        critical_component_missing = True
     if not loaded_preprocessor or not loaded_code_normalizer:
-        return jsonify({"error": "Preprocessors not loaded. API is not ready."}), 500
+        app.logger.error("/predict called but preprocessors are not loaded.")
+        critical_component_missing = True
     if not loaded_global_text_embedder or not loaded_global_text_embedder._fitted:
+        app.logger.error("/predict called but Global TextEmbedder is not ready.")
+        critical_component_missing = True
+    if critical_component_missing:
         return (
             jsonify(
                 {
-                    "error": "Global TextEmbedder not loaded or not fitted. API cannot make predictions."
+                    "error": "Core API components not loaded or not ready. Prediction unavailable."
                 }
             ),
-            500,
-        )
+            503,
+        )  # Service Unavailable
 
     try:
         data = request.get_json()
@@ -239,8 +295,8 @@ def predict():
         language = data.get("language")
 
         if not all(
-            [statement is not None, code_submission is not None, language is not None]
-        ):  # Check for presence
+            field is not None for field in [statement, code_submission, language]
+        ):
             return (
                 jsonify(
                     {
@@ -265,6 +321,7 @@ def predict():
                 400,
             )
 
+        # 1. Preprocessing
         full_statement_raw = (
             str(statement).strip()
             + "\nInput: "
@@ -272,66 +329,117 @@ def predict():
             + "\nOutput: "
             + str(output_spec).strip()
         )
-        # Preprocessor is global
         processed_statement = loaded_preprocessor.preprocess_text(full_statement_raw)
-        # CodeNormalizer is global
         normalized_code = loaded_code_normalizer.normalize_code(
             str(code_submission), requested_lang_normalized
         )
 
+        # 2. Model Prediction
         with torch.no_grad():
-            # selected_model already contains its ConcatEmbedder, which contains
-            # its CodeEmbedderGNN and the shared loaded_global_text_embedder
             verdict_logits = selected_model(
                 code_list=[normalized_code],
                 text_list=[processed_statement],
                 lang=requested_lang_normalized,
             )
 
-        probabilities = torch.softmax(verdict_logits, dim=1).squeeze()
-        predicted_id = torch.argmax(probabilities).item()
+        # 3. Process output & Calculate Scores
+        probabilities_tensor = torch.softmax(verdict_logits, dim=1).squeeze()
+        predicted_id = torch.argmax(probabilities_tensor).item()
         predicted_verdict_str = cfg.ID_TO_VERDICT_MAP.get(
-            predicted_id, "Error: Unmapped Verdict ID"
+            predicted_id, f"Error: Unmapped ID {predicted_id}"
         )
-        class_probabilities = {
-            cfg.ID_TO_VERDICT_MAP.get(i, f"Class_{i}"): prob.item()
-            for i, prob in enumerate(probabilities)
-        }
+
+        verdict_probs_map: Dict[str, float] = {}
+        for i, prob_value in enumerate(probabilities_tensor):
+            verdict_name = cfg.ID_TO_VERDICT_MAP.get(i, f"UnknownClass_{i}")
+            verdict_probs_map[verdict_name] = prob_value.item()
+
+        correctness_score = (
+            1.0 * verdict_probs_map.get("Accepted", 0.0)
+            + 0.5 * verdict_probs_map.get("Presentation Error", 0.0)
+            + 0.3 * verdict_probs_map.get("Wrong Answer", 0.0)
+        )
+        efficiency_score = (
+            1.0 * verdict_probs_map.get("Accepted", 0.0)
+            + 0.9 * verdict_probs_map.get("Wrong Answer", 0.0)
+            + 0.9 * verdict_probs_map.get("Presentation Error", 0.0)
+            + 0.2 * verdict_probs_map.get("Runtime Error", 0.0)
+            + 0.1 * verdict_probs_map.get("Compile Error", 0.0)
+        )
+        efficiency_score -= 1.0 * verdict_probs_map.get(
+            "Time Limit Exceeded", 0.0
+        ) + 1.0 * verdict_probs_map.get("Memory Limit Exceeded", 0.0)
+        correctness_score = round(max(0.0, min(1.0, correctness_score)), 4)
+        efficiency_score = round(max(-1.0, min(1.0, efficiency_score)), 4)
 
         response = {
             "requested_language": language,
             "predicted_verdict_id": predicted_id,
             "predicted_verdict_string": predicted_verdict_str,
-            "verdict_probabilities": class_probabilities,
+            "verdict_probabilities": verdict_probs_map,
+            "scores": {
+                "correctness_score": correctness_score,
+                "efficiency_score": efficiency_score,
+            },
         }
+        app.logger.info(
+            f"Prediction successful for lang: {language}, predicted: {predicted_verdict_str}"
+        )
         return jsonify(response), 200
 
     except Exception as e:
-        app.logger.error(f"Error during prediction: {e}")
-        import traceback
-
-        traceback.print_exc()
+        app.logger.error(
+            f"Error during prediction for lang '{language if 'language' in locals() else 'unknown'}': {type(e).__name__} - {e}",
+            exc_info=True,
+        )
         return jsonify({"error": f"An internal error occurred: {str(e)}"}), 500
 
 
 if __name__ == "__main__":
-    try:
-        load_inference_components()
-        if not loaded_models:
-            print(
-                "API cannot start as no models were successfully loaded. Check logs and file paths in api_config.py."
-            )
-        elif not loaded_global_text_embedder or not loaded_global_text_embedder._fitted:
-            print(
-                "API may have issues as Global TextEmbedder failed to load or is not fitted."
-            )
-            app.run(
-                debug=True, host="0.0.0.0", port=5000
-            )  # Still run if some models loaded but text embedder is an issue
-        else:
-            app.run(debug=True, host="0.0.0.0", port=5000)
-    except Exception as startup_error:
-        print(f"FATAL ERROR during API startup: {startup_error}")
-        import traceback
+    # --- Setup Flask App Logger ---
+    # Define where API logs will go (can be different from training logs)
+    API_LOG_FILE = os.path.join(
+        cfg.LOG_DIR if hasattr(cfg, "LOG_DIR") else "training_logs",
+        "api_runtime_log.txt",
+    )
+    if not hasattr(cfg, "LOG_DIR") and not os.path.exists("training_logs"):
+        os.makedirs("training_logs", exist_ok=True)  # Ensure default log dir exists
 
-        traceback.print_exc()
+    setup_api_logger(app, API_LOG_FILE)  # Configure app.logger
+
+    try:
+        load_inference_components()  # Load models when the app starts
+
+        ready_to_run = True
+        if not loaded_models:
+            app.logger.critical("API cannot start: no models were successfully loaded.")
+            ready_to_run = False
+        if not loaded_global_text_embedder or not loaded_global_text_embedder._fitted:
+            app.logger.warning(
+                "API WARNING: Global TextEmbedder failed to load or is not fitted. Predictions will likely fail."
+            )
+            # Depending on strictness, you might set ready_to_run = False here too
+
+        if ready_to_run:
+            app.logger.info("Starting Flask development server for API...")
+            # For development: debug=True, use_reloader=True (but can cause double logging/init)
+            # For this controlled setup: debug=False, use_reloader=False to rely on our logger
+            app.run(debug=False, host="0.0.0.0", port=5000, use_reloader=False)
+        else:
+            app.logger.info(
+                "Flask app not started due to critical component loading failures."
+            )
+
+    except Exception as startup_error:
+        # Use app.logger if available, else print
+        if hasattr(app, "logger") and app.logger.handlers:  # Check if handlers are set
+            app.logger.critical(
+                f"FATAL ERROR during API startup: {startup_error}", exc_info=True
+            )
+        else:
+            print(
+                f"FATAL ERROR during API startup (app.logger not fully configured): {startup_error}"
+            )
+            import traceback
+
+            traceback.print_exc()

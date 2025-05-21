@@ -45,6 +45,10 @@ PREDICTOR_MLP_HIDDEN_DIMS_API = [128, 64]
 
 DEVICE_API = "cpu"
 
+# api_config.py (relevant parts)
+
+NUM_VERDICT_CLASSES_API = 7
+
 ID_TO_VERDICT_MAP = {
     0: "Accepted",
     1: "Wrong Answer",
@@ -53,5 +57,8 @@ ID_TO_VERDICT_MAP = {
     4: "Runtime Error",
     5: "Compile Error",
     6: "Presentation Error",
-    -1: "Unknown Verdict ID",
+    -1: "Unknown Verdict ID",  # Should not happen with a softmax output over known classes
 }
+
+# For easy lookup from string to ID (used in score calculation)
+VERDICT_TO_ID_MAP_API = {v: k for k, v in ID_TO_VERDICT_MAP.items() if k != -1}
