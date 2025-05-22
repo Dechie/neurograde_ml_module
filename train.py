@@ -90,14 +90,14 @@ BATCH_SIZE = 32  # Batch size per language model
 NUM_EPOCHS_PER_LANGUAGE_TURN = (
     1  # Number of epochs to run for a language before switching
 )
-TOTAL_INTERLEAVED_EPOCHS = 10  # Total "outer" epochs (each outer epoch trains all langs for NUM_EPOCHS_PER_LANGUAGE_TURN)
+TOTAL_INTERLEAVED_EPOCHS = 20  # Total "outer" epochs (each outer epoch trains all langs for NUM_EPOCHS_PER_LANGUAGE_TURN)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 VALIDATION_SPLIT_RATIO = 0.2
 SAVE_COMPONENTS_BASE_DIR = (
     "saved_model_components"  # Base dir for lang-specific subdirs
 )
 
-NUM_EPOCHS = 10  # Total number of effective epochs PER LANGUAGE
+NUM_EPOCHS = 20  # Total number of effective epochs PER LANGUAGE
 DEFAULT_START_EPOCH = 0
 
 NUM_WORKERS_DATALOADER = 2  # Adjusted based on typical Colab CPU, try 4 if beneficial

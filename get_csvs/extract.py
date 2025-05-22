@@ -80,19 +80,19 @@ METADATA_REQUIRED_COLS = [
 GLOBAL_SAMPLING_TARGETS_PER_LANG = {
     # These are examples, TUNE THEM based on your data and desired balance!
     # 'cap_at' is an absolute maximum for a class.
-    "Accepted": {"strategy": "max_samples", "value": 15000},  # Cap majority class
+    "Accepted": {"strategy": "max_samples", "value": 30000},  # Cap majority class
     "Wrong Answer": {
         "strategy": "max_samples",
-        "value": 12000,
+        "value": 24000,
     },  # Cap another large class
     "Time Limit Exceeded": {
         "strategy": "min_samples_or_all",
-        "value": 40000,
+        "value": 20000,
     },  # Try for 4k, or take all if less
-    "Memory Limit Exceeded": {"strategy": "min_samples_or_all", "value": 30000},
-    "Runtime Error": {"strategy": "min_samples_or_all", "value": 40000},
-    "Compile Error": {"strategy": "min_samples_or_all", "value": 30000},
-    "Presentation Error": {"strategy": "min_samples_or_all", "value": 20000},
+    "Memory Limit Exceeded": {"strategy": "min_samples_or_all", "value": 15000},
+    "Runtime Error": {"strategy": "min_samples_or_all", "value": 20000},
+    "Compile Error": {"strategy": "min_samples_or_all", "value": 15000},
+    "Presentation Error": {"strategy": "min_samples_or_all", "value": 10000},
 }
 # Fallback for verdicts not explicitly listed above
 DEFAULT_SAMPLING_STRATEGY_PER_LANG = {
