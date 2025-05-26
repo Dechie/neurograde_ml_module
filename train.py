@@ -1,7 +1,6 @@
 # train_model.py (Interleaved Multi-Language Training)
 
 import os
-import shutil
 import pandas as pd
 import json
 import joblib
@@ -9,9 +8,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
-from typing import Dict, List, Tuple, Any, Optional  # Added Optional
+from typing import Dict, List, Any, Optional  # Added Optional
 import logging
-import datetime
 
 # --- AMP Components ---
 try:
@@ -67,7 +65,7 @@ ACTUAL_SUBMISSION_STATS_CSV_TPL = "data/submission_stats_{lang_cap}.csv"
 LANGUAGES_TO_TRAIN = [
     "cpp",
     "python",
-    "java",
+    # "java",
 ]  # <<< Languages to interleave training for
 
 LOG_DIR = "training_logs"
@@ -75,16 +73,16 @@ LOG_DIR = "training_logs"
 MASTER_LOG_FILE = os.path.join(LOG_DIR, "master_training_log.txt")
 
 # Model & Training Hyperparameters (assumed mostly shared)
-TEXT_EMB_MAX_FEATURES = 5000
+TEXT_EMB_MAX_FEATURES = 4000
 CODE_GNN_NODE_VOCAB_SIZE = 2000
-CODE_GNN_NODE_EMB_DIM = 64
-CODE_GNN_HIDDEN_DIM = 128
-CODE_GNN_OUT_DIM = 64
-CODE_GNN_LAYERS = 2
+CODE_GNN_NODE_EMB_DIM = 128
+CODE_GNN_HIDDEN_DIM = 256
+CODE_GNN_OUT_DIM = 128
+CODE_GNN_LAYERS = 3
 CONCAT_USE_PROJECTION = True
-CONCAT_PROJECTION_SCALE = 0.5
+CONCAT_PROJECTION_SCALE = 0.4
 NUM_VERDICT_CLASSES = 7
-PREDICTOR_MLP_HIDDEN_DIMS = [128, 64]
+PREDICTOR_MLP_HIDDEN_DIMS = [256, 256, 128, 64]
 LEARNING_RATE = 5e-5
 BATCH_SIZE = 32  # Batch size per language model
 NUM_EPOCHS_PER_LANGUAGE_TURN = (
@@ -97,7 +95,7 @@ SAVE_COMPONENTS_BASE_DIR = (
     "saved_model_components"  # Base dir for lang-specific subdirs
 )
 
-NUM_EPOCHS = 20  # Total number of effective epochs PER LANGUAGE
+NUM_EPOCHS = 30  # Total number of effective epochs PER LANGUAGE
 DEFAULT_START_EPOCH = 0
 
 NUM_WORKERS_DATALOADER = 2  # Adjusted based on typical Colab CPU, try 4 if beneficial

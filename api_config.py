@@ -72,10 +72,6 @@ The predicted primary verdict for this submission is: "{predicted_verdict_string
 The model has also provided the following probability distribution across all possible verdicts:
 {verdict_probabilities_str}
 
-Additionally, the submission received:
-- A **Correctness Score** of {correctness_score:.2f} (range: 0.0 to 1.0; higher values indicate greater alignment with expected behavior)
-- An **Efficiency Score** of {efficiency_score:.2f} (range: -1.0 to 1.0; higher values indicate better performance and resource usage)
-
 Based on this analysis, provide a brief and informative review (2–3 sentences) for the instructor. Your response should:
 - Acknowledge success if the predicted verdict is "Accepted" and optionally highlight the strong scores.
 - If the verdict indicates a failure (e.g., "Wrong Answer", "Compile Error", "Runtime Error"), identify the general area of concern and suggest likely causes or next steps the student could take.

@@ -369,30 +369,6 @@ def predict():
             for i, prob in enumerate(probabilities_tensor)
         }
 
-        correctness_score = (
-            1.0 * vpm.get("Accepted", 0)
-            + 0.5 * vpm.get("Presentation Error", 0)
-            + 0.3 * vpm.get("Wrong Answer", 0)
-            for vpm in [verdict_probs_map]
-        )  # Generator for single item
-        correctness_score = next(correctness_score)  # Get value
-
-        efficiency_score_val = (
-            1.0 * vpm.get("Accepted", 0)
-            + 0.9 * vpm.get("Wrong Answer", 0)
-            + 0.9 * vpm.get("Presentation Error", 0)
-            + 0.2 * vpm.get("Runtime Error", 0)
-            + 0.1 * vpm.get("Compile Error", 0)
-            for vpm in [verdict_probs_map]
-        )
-        efficiency_score_val = next(efficiency_score_val)
-        efficiency_score_val -= 1.0 * verdict_probs_map.get(
-            "Time Limit Exceeded", 0
-        ) + 1.0 * verdict_probs_map.get("Memory Limit Exceeded", 0)
-
-        correctness_score = round(max(0.0, min(1.0, correctness_score)), 4)
-        efficiency_score = round(max(-1.0, min(1.0, efficiency_score_val)), 4)
-
         # --- LLM Review Generation ---
         llm_review = "LLM review disabled or LLM not available."
         if cfg.ENABLE_LLM_REVIEW and gemini_llm_instance:
@@ -412,8 +388,6 @@ def predict():
                     language=language,
                     predicted_verdict_string=predicted_verdict_str,
                     verdict_probabilities_str=verdict_probabilities_str_for_prompt,
-                    correctness_score=correctness_score,
-                    efficiency_score=efficiency_score,
                 )
 
                 # Langchain specific invocation
@@ -443,10 +417,6 @@ def predict():
             "predicted_verdict_id": predicted_id,
             "predicted_verdict_string": predicted_verdict_str,
             "verdict_probabilities": verdict_probs_map,
-            "custom_scores": {
-                "correctness_score": correctness_score,
-                "efficiency_score": efficiency_score,
-            },
             "llm_review": llm_review,  # Add LLM review to the response
         }
         return jsonify(response), 200

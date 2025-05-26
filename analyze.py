@@ -1,14 +1,12 @@
-# analyze_model_predictions.py
-
 import os
 import json
 import joblib
 import pandas as pd
 import torch
-from torch.utils.data import (
-    DataLoader,
-)  # For iterating if needed, though direct iteration is also fine for this task
-from typing import Dict, List, Any, Optional
+from torch.utils.data import DataLoader
+from typing import Dict, List, Any, Optional, Set, Tuple
+from collections import defaultdict
+import random
 
 # --- Import Custom Modules ---
 try:
@@ -17,67 +15,48 @@ try:
     from text_embedder import TextEmbedder
     from code_embedder import CodeEmbedderGNN
     from concat_embedder import ConcatEmbedder
-    from submission_dataset import (
-        SubmissionDataset,
-    )  # We'll use its __getitem__ and _encode_verdict
+    from submission_dataset import SubmissionDataset
     from submission_predictor import SubmissionPredictor
 except ImportError as e:
     print(f"CRITICAL IMPORT ERROR: {e}. Ensure all component .py files are accessible.")
     exit()
 
 # --- Configuration ---
-# Specify the language of the pre-trained model and dataset to analyze
-TARGET_LANG = "python"  # Options: "python", "java", "cpp" (lowercase)
+LANGUAGES_TO_ANALYZE = ["cpp", "python", "java"]  # Lowercase
 
-# Paths to the saved model components (these should match how train_model.py saves them)
-SAVE_COMPONENTS_BASE_DIR = "saved_model_components"  # Base directory
-LANG_SAVE_DIR = os.path.join(SAVE_COMPONENTS_BASE_DIR, TARGET_LANG)
-
-MODEL_FILE = os.path.join(LANG_SAVE_DIR, f"submission_predictor_{TARGET_LANG}.pth")
-# Assuming a globally fitted TextEmbedder was used for all languages during training
-# and saved once. If it was saved per language, adjust path.
+SAVE_COMPONENTS_BASE_DIR = "saved_model_components"
 GLOBAL_TEXT_EMBEDDER_VECTORIZER_FILE = os.path.join(
     SAVE_COMPONENTS_BASE_DIR, "global_text_embedder.joblib"
 )
-# Or if TextEmbedder was saved per language:
-# TEXT_EMBEDDER_VECTORIZER_FILE = os.path.join(LANG_SAVE_DIR, f"text_embedder_{TARGET_LANG}.joblib")
+MODEL_FILENAME_TPL = "submission_predictor_{lang_key}.pth"
+CODE_GNN_VOCAB_FILENAME_TPL = "code_gnn_vocab_{lang_key}.json"
 
-CODE_GNN_VOCAB_FILE = os.path.join(LANG_SAVE_DIR, f"code_gnn_vocab_{TARGET_LANG}.json")
-
-# Dataset CSV paths (these should match your actual data structure)
-PROBLEM_CSV = "data/final_problem_statements.csv"
+PROBLEM_CSV_PATH = "data/final_problem_statements.csv"
 SUBMISSIONS_CODE_CSV_TPL = "data/submissions_{lang_cap}.csv"
 SUBMISSION_STATS_CSV_TPL = "data/submission_stats_{lang_cap}.csv"
 
-# Model Hyperparameters (MUST match the architecture of the saved model)
-# TextEmbedder params used when GLOBAL_TEXT_EMBEDDER_VECTORIZER_FILE was created
-# Not strictly needed if TextEmbedder just loads the vectorizer_model, but good for reference.
-# TEXT_EMB_MAX_FEATURES_ANALYSIS = 5000
+# Model Hyperparameters (MUST match saved models)
+CODE_GNN_NODE_VOCAB_SIZE_CONF = 2000
+CODE_GNN_NODE_EMB_DIM_CONF = 64
+CODE_GNN_HIDDEN_DIM_CONF = 128
+CODE_GNN_OUT_DIM_CONF = 64
+CODE_GNN_LAYERS_CONF = 2
+CONCAT_USE_PROJECTION_CONF = True
+CONCAT_PROJECTION_SCALE_CONF = 0.5
+NUM_VERDICT_CLASSES_CONF = 7
+PREDICTOR_MLP_HIDDEN_DIMS_CONF = [128, 64]
 
-# CodeEmbedderGNN params
-CODE_GNN_NODE_VOCAB_SIZE_ANALYSIS = 2000  # From training config
-CODE_GNN_NODE_EMB_DIM_ANALYSIS = 64
-CODE_GNN_HIDDEN_DIM_ANALYSIS = 128
-CODE_GNN_OUT_DIM_ANALYSIS = 64
-CODE_GNN_LAYERS_ANALYSIS = 2
+DEVICE_CONF = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ConcatEmbedder params
-CONCAT_USE_PROJECTION_ANALYSIS = True  # Match training
-CONCAT_PROJECTION_SCALE_ANALYSIS = 0.5
+# Analysis Parameters
+MAX_PROBLEMS_TO_COLLECT = 20
+MAX_CORRECT_SAMPLES_PER_VERDICT_PER_LANG_PER_PROBLEM = (
+    6  # Aim for this many for each verdict type
+)
 
-# SubmissionPredictor params
-NUM_VERDICT_CLASSES_ANALYSIS = 7
-PREDICTOR_MLP_HIDDEN_DIMS_ANALYSIS = [128, 64]
+OUTPUT_CSV = "analysis_cross_language_diverse_correct_predictions.csv"
 
-DEVICE_ANALYSIS = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-MAX_SAMPLES_TO_COLLECT = 100  # Collect up to this many correct and incorrect samples
-
-# Output file names
-CORRECT_SAMPLES_CSV = f"data/analysis_correct_{TARGET_LANG}.csv"
-INCORRECT_SAMPLES_CSV = f"data/analysis_incorrect_{TARGET_LANG}.csv"
-
-# For mapping predicted ID back to string (ensure this matches training)
-ID_TO_VERDICT_MAP_ANALYSIS = {
+ID_TO_VERDICT_MAP_CONF = {
     0: "Accepted",
     1: "Wrong Answer",
     2: "Time Limit Exceeded",
@@ -87,29 +66,119 @@ ID_TO_VERDICT_MAP_ANALYSIS = {
     6: "Presentation Error",
     -1: "Unknown Verdict ID",
 }
+VERDICT_NAMES_ORDERED = [
+    ID_TO_VERDICT_MAP_CONF[i] for i in range(NUM_VERDICT_CLASSES_CONF)
+]
+
+
+def load_model_and_components_for_lang(
+    target_lang: str,
+    global_text_embedder: TextEmbedder,
+    preprocessor: Preprocessor,
+    code_normalizer: CodeNormalizer,
+) -> Tuple[Optional[SubmissionPredictor], Optional[SubmissionDataset]]:
+    """Loads model, dataset, and other components for a single language."""
+    print(f"  Loading components for language: {target_lang}...")
+    lang_cap_for_file = target_lang.capitalize()
+    lang_save_dir = os.path.join(SAVE_COMPONENTS_BASE_DIR, target_lang)
+
+    model_file = os.path.join(
+        lang_save_dir, MODEL_FILENAME_TPL.format(lang_key=target_lang)
+    )
+    code_gnn_vocab_file = os.path.join(
+        lang_save_dir, CODE_GNN_VOCAB_FILENAME_TPL.format(lang_key=target_lang)
+    )
+
+    model_lang: Optional[SubmissionPredictor] = None
+    dataset_lang: Optional[SubmissionDataset] = None
+
+    try:
+        if not os.path.exists(code_gnn_vocab_file):
+            print(f"    CodeGNN vocab for {target_lang} not found. Skipping.")
+            return None, None
+        with open(code_gnn_vocab_file, "r") as f:
+            code_gnn_vocab_data = json.load(f)
+        code_embedder_gnn_lang = CodeEmbedderGNN(
+            code_gnn_vocab_data.get("node_vocab_size", CODE_GNN_NODE_VOCAB_SIZE_CONF),
+            CODE_GNN_NODE_EMB_DIM_CONF,
+            CODE_GNN_HIDDEN_DIM_CONF,
+            CODE_GNN_OUT_DIM_CONF,
+            CODE_GNN_LAYERS_CONF,
+        ).to(DEVICE_CONF)
+        code_embedder_gnn_lang.node_type_to_id = code_gnn_vocab_data["node_type_to_id"]
+        code_embedder_gnn_lang.next_node_type_id = code_gnn_vocab_data[
+            "next_node_type_id"
+        ]
+
+        concat_embedder_lang = ConcatEmbedder(
+            code_embedder_gnn_lang,
+            global_text_embedder,
+            CONCAT_USE_PROJECTION_CONF,
+            CONCAT_PROJECTION_SCALE_CONF,
+        ).to(DEVICE_CONF)
+
+        if not os.path.exists(model_file):
+            print(f"    Model file for {target_lang} not found. Skipping.")
+            return None, None
+        model_lang = SubmissionPredictor(
+            concat_embedder_lang,
+            NUM_VERDICT_CLASSES_CONF,
+            PREDICTOR_MLP_HIDDEN_DIMS_CONF,
+        ).to(DEVICE_CONF)
+        model_lang.load_state_dict(torch.load(model_file, map_location=DEVICE_CONF))
+        model_lang.eval()
+        print(f"    Model for {target_lang} loaded.")
+
+        submissions_code_csv = SUBMISSIONS_CODE_CSV_TPL.format(
+            lang_cap=lang_cap_for_file
+        )
+        submission_stats_csv = SUBMISSION_STATS_CSV_TPL.format(
+            lang_cap=lang_cap_for_file
+        )
+        if not (
+            os.path.exists(submissions_code_csv)
+            and os.path.exists(submission_stats_csv)
+        ):
+            print(f"    Dataset CSVs for {target_lang} not found. Skipping.")
+            return model_lang, None  # Return model if it loaded
+
+        dataset_lang = SubmissionDataset(
+            submission_stats_csv,
+            submissions_code_csv,
+            PROBLEM_CSV_PATH,
+            preprocessor,
+            code_normalizer,
+        )
+        if len(dataset_lang) == 0:
+            print(f"    Dataset for {target_lang} is empty. No samples.")
+            return model_lang, None
+        print(f"    Dataset for {target_lang} loaded with {len(dataset_lang)} samples.")
+
+    except Exception as e:
+        print(
+            f"    ERROR loading components or dataset for {target_lang}: {e}. Skipping."
+        )
+        return None, None
+    return model_lang, dataset_lang
 
 
 # --- Main Analysis Script ---
-def analyze_predictions():
-    print(f"--- Starting Prediction Analysis for Language: {TARGET_LANG.upper()} ---")
-    print(f"Using device: {DEVICE_ANALYSIS}")
+def find_diverse_correct_predictions():
+    print(
+        f"--- Starting Analysis: Finding Problems with Diverse Correct Predictions ---"
+    )
+    print(f"Target languages: {', '.join(LANGUAGES_TO_ANALYZE)}")
+    print(f"Device: {DEVICE_CONF}")
 
-    # 1. Load Preprocessor and CodeNormalizer (stateless)
+    # 1. Load shared components
     try:
         preprocessor = Preprocessor()
         code_normalizer = CodeNormalizer()
         print("Preprocessor and CodeNormalizer initialized.")
-    except Exception as e:
-        print(f"Error initializing Preprocessor/CodeNormalizer: {e}")
-        return
 
-    # 2. Load Globally Fitted TextEmbedder
-    print(f"Loading Global TextEmbedder from: {GLOBAL_TEXT_EMBEDDER_VECTORIZER_FILE}")
-    global_text_embedder: Optional[TextEmbedder] = None
-    try:
         if not os.path.exists(GLOBAL_TEXT_EMBEDDER_VECTORIZER_FILE):
             print(
-                f"ERROR: Global TextEmbedder vectorizer file NOT FOUND at '{GLOBAL_TEXT_EMBEDDER_VECTORIZER_FILE}'. Cannot proceed."
+                f"ERROR: Global TextEmbedder file NOT FOUND at '{GLOBAL_TEXT_EMBEDDER_VECTORIZER_FILE}'. Aborting."
             )
             return
         tfidf_vectorizer_fitted = joblib.load(GLOBAL_TEXT_EMBEDDER_VECTORIZER_FILE)
@@ -119,287 +188,255 @@ def analyze_predictions():
             hasattr(global_text_embedder.vectorizer, "vocabulary_")
             and global_text_embedder.vectorizer.vocabulary_
         ):
-            print("WARNING: Loaded Global TfidfVectorizer does not appear fitted.")
+            print("WARNING: Global TfidfVectorizer appears unfitted.")
             global_text_embedder._fitted = False
-        print(
-            f"Global TextEmbedder loaded. Fitted: {global_text_embedder._fitted}, Vocab: {len(global_text_embedder.get_feature_names()) if global_text_embedder._fitted else 'N/A'}"
-        )
         if not global_text_embedder._fitted:
-            print("ERROR: Global TextEmbedder is not properly fitted. Cannot proceed.")
+            print("ERROR: Global TextEmbedder not properly fitted. Aborting.")
             return
-    except Exception as e:
-        print(f"ERROR loading Global TextEmbedder: {e}")
-        return
-
-    # 3. Load CodeEmbedderGNN (with vocab)
-    print(f"Loading CodeEmbedderGNN vocab from: {CODE_GNN_VOCAB_FILE}")
-    code_embedder_gnn: Optional[CodeEmbedderGNN] = None
-    try:
-        if not os.path.exists(CODE_GNN_VOCAB_FILE):
-            print(
-                f"ERROR: CodeGNN vocab file NOT FOUND at '{CODE_GNN_VOCAB_FILE}'. Cannot proceed."
-            )
-            return
-        with open(CODE_GNN_VOCAB_FILE, "r") as f:
-            code_gnn_vocab_data = json.load(f)
-
-        code_embedder_gnn = CodeEmbedderGNN(
-            node_vocab_size=code_gnn_vocab_data.get(
-                "node_vocab_size", CODE_GNN_NODE_VOCAB_SIZE_ANALYSIS
-            ),
-            node_embedding_dim=CODE_GNN_NODE_EMB_DIM_ANALYSIS,
-            hidden_gnn_dim=CODE_GNN_HIDDEN_DIM_ANALYSIS,
-            out_graph_embedding_dim=CODE_GNN_OUT_DIM_ANALYSIS,
-            num_gnn_layers=CODE_GNN_LAYERS_ANALYSIS,
-        ).to(DEVICE_ANALYSIS)
-        code_embedder_gnn.node_type_to_id = code_gnn_vocab_data["node_type_to_id"]
-        code_embedder_gnn.next_node_type_id = code_gnn_vocab_data["next_node_type_id"]
-        print(f"CodeEmbedderGNN for {TARGET_LANG} initialized and vocab loaded.")
-    except Exception as e:
-        print(f"ERROR loading CodeEmbedderGNN for {TARGET_LANG}: {e}")
-        return
-
-    # 4. Load ConcatEmbedder
-    print("Initializing ConcatEmbedder...")
-    concat_embedder: Optional[ConcatEmbedder] = None
-    try:
-        concat_embedder = ConcatEmbedder(
-            code_embedder=code_embedder_gnn,
-            text_embedder=global_text_embedder,
-            use_projection=CONCAT_USE_PROJECTION_ANALYSIS,
-            projection_dim_scale_factor=CONCAT_PROJECTION_SCALE_ANALYSIS,
-        ).to(DEVICE_ANALYSIS)
-        print(f"ConcatEmbedder initialized. Final dim: {concat_embedder.final_dim}")
-    except Exception as e:
-        print(f"ERROR initializing ConcatEmbedder: {e}")
-        return
-
-    # 5. Load SubmissionPredictor Model
-    print(f"Loading SubmissionPredictor model from: {MODEL_FILE}")
-    model: Optional[SubmissionPredictor] = None
-    try:
-        if not os.path.exists(MODEL_FILE):
-            print(f"ERROR: Model file NOT FOUND at '{MODEL_FILE}'. Cannot proceed.")
-            return
-        model = SubmissionPredictor(
-            concat_embedder=concat_embedder,
-            num_verdict_classes=NUM_VERDICT_CLASSES_ANALYSIS,
-            mlp_hidden_dims=PREDICTOR_MLP_HIDDEN_DIMS_ANALYSIS,
-        ).to(DEVICE_ANALYSIS)
-        model.load_state_dict(torch.load(MODEL_FILE, map_location=DEVICE_ANALYSIS))
-        model.eval()  # Set to evaluation mode
-        print("SubmissionPredictor model loaded and set to evaluation mode.")
-    except Exception as e:
-        print(f"ERROR loading SubmissionPredictor model: {e}")
-        return
-
-    # --- All components should be loaded now ---
-    if not all(
-        [
-            preprocessor,
-            code_normalizer,
-            global_text_embedder,
-            code_embedder_gnn,
-            concat_embedder,
-            model,
-        ]
-    ):
         print(
-            "CRITICAL: One or more essential components failed to initialize. Aborting analysis."
+            f"Global TextEmbedder loaded. Vocab: {len(global_text_embedder.get_feature_names())}"
         )
+    except Exception as e:
+        print(f"Error initializing shared components: {e}")
         return
 
-    # 6. Load the Dataset
-    print(f"\n--- Setting up SubmissionDataset for {TARGET_LANG.upper()} ---")
-    lang_cap_for_file = TARGET_LANG.capitalize()
-    problem_csv_path = PROBLEM_CSV
-    submissions_code_csv_path = SUBMISSIONS_CODE_CSV_TPL.format(
-        lang_cap=lang_cap_for_file
-    )
-    submission_stats_csv_path = SUBMISSION_STATS_CSV_TPL.format(
-        lang_cap=lang_cap_for_file
-    )
-
-    try:
-        dataset = SubmissionDataset(
-            stats_csv_path=submission_stats_csv_path,
-            code_csv_path=submissions_code_csv_path,
-            problem_csv_path=problem_csv_path,
-            preprocessor_instance=preprocessor,
-            code_normalizer_instance=code_normalizer,
-            # Note: SubmissionDataset no longer takes concat_embedder directly
+    # 2. Load models and datasets for all target languages
+    models_by_lang: Dict[str, SubmissionPredictor] = {}
+    datasets_by_lang: Dict[str, SubmissionDataset] = {}
+    for lang in LANGUAGES_TO_ANALYZE:
+        model, dataset = load_model_and_components_for_lang(
+            lang, global_text_embedder, preprocessor, code_normalizer
         )
-        if len(dataset) == 0:
+        if model and dataset:
+            models_by_lang[lang] = model
+            datasets_by_lang[lang] = dataset
+        else:
             print(
-                f"ERROR: Dataset for {TARGET_LANG} is empty. Cannot perform analysis."
+                f"  Could not load full components for {lang}. It will be excluded from cross-language analysis."
+            )
+
+    if not models_by_lang or len(models_by_lang) < len(
+        LANGUAGES_TO_ANALYZE
+    ):  # Ensure all specified langs loaded
+        print(
+            "Not all languages had their models/datasets loaded successfully. Aborting detailed analysis."
+        )
+        # If you want to proceed with available languages, adjust this check.
+        # For now, let's assume we need all specified languages.
+        if (
+            len(models_by_lang) < 2
+        ):  # Need at least 2 to make cross-language meaningful for this script
+            print(
+                "Need at least two languages loaded to find cross-language problem examples. Aborting."
             )
             return
-        print(f"Dataset loaded with {len(dataset)} samples for {TARGET_LANG}.")
-    except Exception as e:
-        print(f"ERROR initializing SubmissionDataset for {TARGET_LANG}: {e}")
+
+    # 3. Get all unique problem IDs present in *all* loaded datasets
+    # This ensures we only consider problems that have data for every language we're analyzing
+    problem_ids_per_lang: Dict[str, Set[str]] = {}
+    for lang, ds in datasets_by_lang.items():
+        problem_ids_per_lang[lang] = set(ds.df["problem_id"].astype(str).unique())
+
+    if not problem_ids_per_lang:
+        print("No problem IDs found in any dataset.")
         return
 
-    # 7. Iterate through dataset and collect samples
+    common_problem_ids = set.intersection(*problem_ids_per_lang.values())
+    if not common_problem_ids:
+        print(
+            "No common problem IDs found across all loaded language datasets. Cannot perform cross-language analysis."
+        )
+        return
     print(
-        f"\n--- Analyzing predictions (collecting up to {MAX_SAMPLES_TO_COLLECT} correct/incorrect samples) ---"
+        f"Found {len(common_problem_ids)} common problem IDs across loaded languages: {list(common_problem_ids)[:5]}..."
     )
-    correctly_predicted_samples = []
-    incorrectly_predicted_samples = []
 
-    # For faster iteration if dataset is huge, consider DataLoader or iterating a subset
-    # For now, iterate directly over the dataset, can be slow for very large ones
+    # 4. Iterate through common problems and collect desired samples
+    all_collected_samples_for_csv: List[Dict] = []
+    problems_fully_collected_count = 0
 
-    # Consider using a DataLoader for batching if iterating the whole dataset is too slow
-    # analysis_dataloader = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=custom_collate_fn)
-    # For item-by-item processing as in your __getitem__ for SubmissionDataset:
+    # Iterate through problems in a shuffled order to get variety if we hit MAX_PROBLEMS_TO_COLLECT early
+    shuffled_common_problem_ids = list(common_problem_ids)
+    random.shuffle(shuffled_common_problem_ids)
 
-    samples_processed = 0
-    for i in range(len(dataset)):
-        if (
-            len(correctly_predicted_samples) >= MAX_SAMPLES_TO_COLLECT
-            and len(incorrectly_predicted_samples) >= MAX_SAMPLES_TO_COLLECT
-        ):
-            print("Collected enough samples for both categories.")
-            break  # Stop if we have enough of both
-
-        try:
-            item_data = dataset[i]  # This is a dictionary from your SubmissionDataset
-        except IndexError:
-            print(f"Warning: Index {i} out of bounds for dataset. Stopping.")
-            break
-        except Exception as e:
-            print(f"Warning: Error getting item {i} from dataset: {e}. Skipping.")
-            continue
-
-        code_str = item_data["code_str"]
-        statement_str = item_data["statement_str"]
-        lang_str = item_data["lang_str"]  # Should match TARGET_LANG
-        true_verdict_encoded = item_data["verdict_encoded"].item()  # Get scalar value
-        true_verdict_raw = item_data["verdict_raw_str"]
-
-        if lang_str.lower() != TARGET_LANG.lower():  # Safety check
+    for problem_id in shuffled_common_problem_ids:
+        if problems_fully_collected_count >= MAX_PROBLEMS_TO_COLLECT:
             print(
-                f"Warning: Sample language '{lang_str}' does not match TARGET_LANG '{TARGET_LANG}'. Skipping sample {i}."
+                f"Collected diverse samples for {MAX_PROBLEMS_TO_COLLECT} problems. Stopping."
             )
-            continue
+            break
 
-        if true_verdict_encoded == -1:  # Skip unmapped verdicts from dataset
-            # print(f"Skipping sample {i} with unmapped true verdict: {true_verdict_raw}")
-            continue
-
-        with torch.no_grad():
-            # Model's forward pass expects lists
-            verdict_logits = model(
-                code_list=[code_str], text_list=[statement_str], lang=lang_str
-            )
-
-        probabilities = torch.softmax(verdict_logits, dim=1).squeeze()
-        predicted_id = torch.argmax(probabilities).item()
-        predicted_verdict_raw = ID_TO_VERDICT_MAP_ANALYSIS.get(
-            predicted_id, "Unknown_Predicted"
+        # For this problem, store correctly predicted samples per lang and per verdict
+        # {lang: {verdict_str: [sample_info, ...]}}
+        correct_preds_for_this_problem_by_lang_verdict = defaultdict(
+            lambda: defaultdict(list)
         )
 
-        # Prepare data for saving (original data + prediction)
-        sample_info_for_csv = {
-            "problem_id": dataset.df.iloc[i].get(
-                "problem_id", "N/A"
-            ),  # Get original problem_id if possible
-            "submission_id": dataset.df.iloc[i].get("submission_id", "N/A"),
-            "language": lang_str,
-            "code": code_str,  # Normalized code
-            "statement_full": (
-                preprocessor.preprocess_text(  # Re-create full raw statement for readability if needed
-                    dataset.df.iloc[i].get("statement", "")
-                    + "\nInput: "
-                    + dataset.df.iloc[i].get("input_spec", "")
-                    + "\nOutput: "
-                    + dataset.df.iloc[i].get("output_spec", "")
+        # Check if this problem can satisfy the diversity criteria
+        potential_to_satisfy_criteria = True  # Assume yes initially
+
+        for lang in LANGUAGES_TO_ANALYZE:
+            if lang not in models_by_lang or lang not in datasets_by_lang:
+                continue  # Should not happen if check above passed
+
+            model = models_by_lang[lang]
+            dataset = datasets_by_lang[lang]
+
+            # Filter dataset for current problem_id for this language
+            problem_specific_indices = dataset.df[
+                dataset.df["problem_id"].astype(str) == problem_id
+            ].index
+            if problem_specific_indices.empty:
+                potential_to_satisfy_criteria = False
+                break  # This lang has no data for this problem
+
+            for i in problem_specific_indices:
+                try:
+                    item_data = dataset[i]
+                except:
+                    continue  # Skip if error getting item
+
+                code_str = item_data["code_str"]
+                statement_str = item_data["statement_str"]
+                # lang_str_from_item = item_data['lang_str'] # Should be `lang`
+                true_verdict_encoded = item_data["verdict_encoded"].item()
+                true_verdict_raw = item_data["verdict_raw_str"]
+
+                if true_verdict_encoded == -1:
+                    continue
+
+                with torch.no_grad():
+                    verdict_logits = model([code_str], [statement_str], lang)
+                probabilities = torch.softmax(verdict_logits, dim=1).squeeze()
+                predicted_id = torch.argmax(probabilities).item()
+
+                if predicted_id == true_verdict_encoded:
+                    # Store enough info to reconstruct the sample later if chosen
+                    if (
+                        len(
+                            correct_preds_for_this_problem_by_lang_verdict[lang][
+                                true_verdict_raw
+                            ]
+                        )
+                        < MAX_CORRECT_SAMPLES_PER_VERDICT_PER_LANG_PER_PROBLEM
+                    ):
+                        correct_preds_for_this_problem_by_lang_verdict[lang][
+                            true_verdict_raw
+                        ].append(
+                            {
+                                "problem_id": problem_id,
+                                "submission_id": dataset.df.iloc[i].get(
+                                    "submission_id", "N/A"
+                                ),
+                                "language_model_used": lang,
+                                "code_original": dataset.df.iloc[i].get("code", "N/A"),
+                                "true_verdict_string": true_verdict_raw,
+                                "predicted_verdict_string": ID_TO_VERDICT_MAP_CONF.get(
+                                    predicted_id, f"ID_{predicted_id}"
+                                ),
+                                # Add probabilities if needed: "probabilities": {n:p for n,p in zip(VERDICT_NAMES_ORDERED, probabilities.tolist())}
+                            }
+                        )
+
+            # After checking all submissions for this lang for this problem,
+            # if any verdict category for this language does not have enough samples,
+            # this problem *might* not meet the strict criteria later.
+            # The strict check: do we have 2 per verdict for *each* language for *this problem*?
+            # Current modified goal: collect what we can per lang/verdict for this problem.
+
+        # Now, check if this problem yielded enough diverse samples ACROSS languages
+        # For the modified goal, we just collect everything found.
+        # The original goal (6 per verdict type for this problem, 2 from each lang) is very strict.
+        # Let's collect all correctly predicted samples we've gathered for this problem from the temp store.
+
+        num_samples_for_this_problem = 0
+        temp_problem_samples_to_add = []
+        for (
+            lang_key_collected,
+            verdicts_map,
+        ) in correct_preds_for_this_problem_by_lang_verdict.items():
+            for verdict_str_collected, samples_list in verdicts_map.items():
+                temp_problem_samples_to_add.extend(samples_list)
+                num_samples_for_this_problem += len(samples_list)
+
+        if (
+            num_samples_for_this_problem > 0
+        ):  # If we found any correct predictions for this problem
+            # For this script's goal, let's check if we got a *decent variety* for this problem overall
+            # e.g., at least N different verdict types represented among the correct predictions for this problem
+            unique_verdicts_found_for_problem = set()
+            for (
+                lang_key_collected,
+                verdicts_map,
+            ) in correct_preds_for_this_problem_by_lang_verdict.items():
+                for verdict_str_collected in verdicts_map.keys():
+                    unique_verdicts_found_for_problem.add(verdict_str_collected)
+
+            # Example diversity check: at least 3 different verdict types correctly predicted for this problem (across all langs)
+            if len(unique_verdicts_found_for_problem) >= 3:
+                all_collected_samples_for_csv.extend(temp_problem_samples_to_add)
+                problems_fully_collected_count += 1
+                print(
+                    f"  Collected {num_samples_for_this_problem} diverse correct predictions for problem_id: {problem_id} ({len(unique_verdicts_found_for_problem)} unique verdict types). Total problems: {problems_fully_collected_count}/{MAX_PROBLEMS_TO_COLLECT}"
                 )
-                if hasattr(dataset, "df")
-                else statement_str
-            ),  # Fallback
-            "true_verdict_encoded": true_verdict_encoded,
-            "true_verdict_string": true_verdict_raw,
-            "predicted_verdict_id": predicted_id,
-            "predicted_verdict_string": predicted_verdict_raw,
-        }
-        # Add individual probabilities
-        for class_idx, prob_val in enumerate(probabilities):
-            class_name = ID_TO_VERDICT_MAP_ANALYSIS.get(
-                class_idx, f"ProbClass{class_idx}"
-            )
-            sample_info_for_csv[f"prob_{class_name.replace(' ', '_')}"] = (
-                prob_val.item()
-            )
+            else:
+                print(
+                    f"  Problem {problem_id} did not yield enough diverse correct verdicts (found {len(unique_verdicts_found_for_problem)} types). Skipping."
+                )
 
-        if predicted_id == true_verdict_encoded:
-            if len(correctly_predicted_samples) < MAX_SAMPLES_TO_COLLECT:
-                correctly_predicted_samples.append(sample_info_for_csv)
-        else:
-            if len(incorrectly_predicted_samples) < MAX_SAMPLES_TO_COLLECT:
-                incorrectly_predicted_samples.append(sample_info_for_csv)
+    # 5. Save to CSV
+    if all_collected_samples_for_csv:
+        df_collected = pd.DataFrame(all_collected_samples_for_csv)
+        # Define column order if desired
+        cols = [
+            "problem_id",
+            "language_model_used",
+            "submission_id",
+            "true_verdict_string",
+            "predicted_verdict_string",
+            "code_original",
+        ]
+        df_collected = df_collected[
+            [c for c in cols if c in df_collected.columns]
+            + [c for c in df_collected.columns if c not in cols]
+        ]
+        df_collected.to_csv(OUTPUT_CSV, index=False)
+        print(
+            f"\nSaved {len(df_collected)} selected samples from {problems_fully_collected_count} problems to: {OUTPUT_CSV}"
+        )
+    else:
+        print(
+            "\nNo samples met the diverse correct prediction criteria across problems."
+        )
 
-        samples_processed += 1
-        if samples_processed % 200 == 0:  # Log progress
-            print(
-                f"  Processed {samples_processed}/{len(dataset)} samples. "
-                f"Collected: Correct={len(correctly_predicted_samples)}, Incorrect={len(incorrectly_predicted_samples)}"
-            )
-
-    print(f"\n--- Analysis Complete ---")
-    print(f"Total samples processed: {samples_processed}")
-    print(f"Correctly predicted samples collected: {len(correctly_predicted_samples)}")
-    print(
-        f"Incorrectly predicted samples collected: {len(incorrectly_predicted_samples)}"
-    )
-
-    # 8. Save to CSV
-    if correctly_predicted_samples:
-        df_correct = pd.DataFrame(correctly_predicted_samples)
-        df_correct.to_csv(CORRECT_SAMPLES_CSV, index=False)
-        print(f"Saved correctly predicted samples to: {CORRECT_SAMPLES_CSV}")
-
-    if incorrectly_predicted_samples:
-        df_incorrect = pd.DataFrame(incorrectly_predicted_samples)
-        df_incorrect.to_csv(INCORRECT_SAMPLES_CSV, index=False)
-        print(f"Saved incorrectly predicted samples to: {INCORRECT_SAMPLES_CSV}")
+    print(f"\n--- Analysis Script Finished ---")
 
 
 if __name__ == "__main__":
     try:
-        if not TARGET_LANG.strip():
-            raise ValueError(
-                "TARGET_LANG configuration is not set at the top of the script."
-            )
-        # Basic check for essential files based on TARGET_LANG
-        lang_cap_check = TARGET_LANG.capitalize()
-        required_data_files = [
-            PROBLEM_CSV,
-            SUBMISSIONS_CODE_CSV_TPL.format(lang_cap=lang_cap_check),
-            SUBMISSION_STATS_CSV_TPL.format(lang_cap=lang_cap_check),
-        ]
-        for f_path in required_data_files:
-            if not os.path.exists(f_path):
-                print(f"ERROR: Required data file for analysis is missing: {f_path}")
-                print("Please ensure paths in the configuration section are correct.")
-                exit()
-
-        required_model_files_dir = os.path.join(SAVE_COMPONENTS_BASE_DIR, TARGET_LANG)
-        if not os.path.isdir(required_model_files_dir):
+        if not LANGUAGES_TO_ANALYZE:
+            raise ValueError("LANGUAGES_TO_ANALYZE is empty.")
+        if not os.path.exists(PROBLEM_CSV_PATH):
+            print(f"ERROR: Problem statements file missing: {PROBLEM_CSV_PATH}")
+            exit()
+        if not os.path.exists(GLOBAL_TEXT_EMBEDDER_VECTORIZER_FILE):
             print(
-                f"ERROR: Saved model components directory not found: {required_model_files_dir}"
+                f"ERROR: Global Text Embedder file missing: {GLOBAL_TEXT_EMBEDDER_VECTORIZER_FILE}"
             )
             exit()
-
-        analyze_predictions()
-    except ImportError as e_main_imp:
-        print(f"Exiting due to critical top-level import errors: {e_main_imp}")
-    except ValueError as ve_main:
-        print(f"Configuration error: {ve_main}")
-    except Exception as e_main:
-        print(
-            f"An UNHANDLED error occurred in __main__ execution: {type(e_main).__name__} - {e_main}"
-        )
+        # Check existence of at least one language's model components to ensure setup is plausible
+        if LANGUAGES_TO_ANALYZE:
+            first_lang_dir = os.path.join(
+                SAVE_COMPONENTS_BASE_DIR, LANGUAGES_TO_ANALYZE[0]
+            )
+            if not os.path.isdir(first_lang_dir):
+                print(
+                    f"ERROR: Saved components directory for first language '{LANGUAGES_TO_ANALYZE[0]}' not found at '{first_lang_dir}'. Ensure models are trained and paths are correct."
+                )
+                exit()
+        find_diverse_correct_predictions()
+    except Exception as e:
+        print(f"An UNHANDLED error occurred: {type(e).__name__} - {e}")
         import traceback
 
         traceback.print_exc()

@@ -30,7 +30,6 @@ except ImportError:
         return np.array([])  # Return empty array
 
 
-# --- Optional: Plotting for Confusion Matrix ---
 try:
     import matplotlib.pyplot as plt
     import seaborn as sns
@@ -83,14 +82,15 @@ SUBMISSION_STATS_CSV_EVAL_TPL = "data/submission_stats_{lang_cap}.csv"
 
 # Model Hyperparameters (MUST match the architecture of the saved model)
 CODE_GNN_NODE_VOCAB_SIZE_EVAL = 2000
-CODE_GNN_NODE_EMB_DIM_EVAL = 64
-CODE_GNN_HIDDEN_DIM_EVAL = 128
-CODE_GNN_OUT_DIM_EVAL = 64
-CODE_GNN_LAYERS_EVAL = 2
+CODE_GNN_NODE_EMB_DIM_EVAL = 128
+CODE_GNN_HIDDEN_DIM_EVAL = 256
+CODE_GNN_OUT_DIM_EVAL = 128
+CODE_GNN_LAYERS_EVAL = 3
 CONCAT_USE_PROJECTION_EVAL = True
-CONCAT_PROJECTION_SCALE_EVAL = 0.5
+CONCAT_PROJECTION_SCALE_EVAL = 0.4
+NUM_VERDICT_CLASSES = 7
+PREDICTOR_MLP_HIDDEN_DIMS_EVAL = [256, 256, 128, 64]
 NUM_VERDICT_CLASSES_EVAL = 7
-PREDICTOR_MLP_HIDDEN_DIMS_EVAL = [128, 64]
 
 DEVICE_EVAL = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE_EVAL = 32  # Can be larger for inference than training if memory allows

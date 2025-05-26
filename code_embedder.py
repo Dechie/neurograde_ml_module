@@ -1,9 +1,7 @@
-# code_embedder_gnn.py
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Any, Optional, List  # Added for type hinting
+from typing import Dict, Any, Optional, List
 
 try:
     from torch_geometric.data import Data as GraphData
