@@ -27,16 +27,16 @@ GLOBAL_TEXT_EMBEDDER_VECTORIZER_FILE = os.path.join(
 # Architectural parameters for CodeEmbedderGNN, ConcatEmbedder, SubmissionPredictor
 # Assumed same architecture for all loaded language models.
 CODE_GNN_NODE_VOCAB_SIZE_API = 2000
-CODE_GNN_NODE_EMB_DIM_API = 64
-CODE_GNN_HIDDEN_DIM_API = 128
-CODE_GNN_OUT_DIM_API = 64
-CODE_GNN_LAYERS_API = 2
+CODE_GNN_NODE_EMB_DIM_API = 128
+CODE_GNN_HIDDEN_DIM_API = 256
+CODE_GNN_OUT_DIM_API = 128
+CODE_GNN_LAYERS_API = 3
 
 CONCAT_USE_PROJECTION_API = True
-CONCAT_PROJECTION_SCALE_API = 0.5
+CONCAT_PROJECTION_SCALE_API = 0.4
 
 NUM_VERDICT_CLASSES_API = 7
-PREDICTOR_MLP_HIDDEN_DIMS_API = [128, 64]
+PREDICTOR_MLP_HIDDEN_DIMS_API = [256, 256, 128, 64]
 
 # TextEmbedder specific hyperparams used when the GLOBAL vectorizer was created (if TextEmbedder class needs them for init)
 # However, if TextEmbedder just takes a vectorizer_model, only the loaded vectorizer is needed.
